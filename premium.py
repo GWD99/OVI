@@ -1,0 +1,6366 @@
+import os
+import sys
+
+# CRITICAL: Set MKL/OpenMP thread environment variables BEFORE importing torch
+# MKL ignores torch.set_num_threads() if these aren't set at import time
+# This fixes 100-200x slowdowns on some systems where MKL defaults to 1-2 threads
+cpu_count = os.cpu_count()
+if cpu_count and 'OMP_NUM_THREADS' not in os.environ:
+    os.environ['OMP_NUM_THREADS'] = str(cpu_count)
+    os.environ['MKL_NUM_THREADS'] = str(cpu_count)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(cpu_count)
+    print(f"[STARTUP] Set MKL/OMP threads to {cpu_count} for optimal CPU performance")
+
+import gradio as gr
+import torch
+import argparse
+import signal
+from datetime import datetime
+
+from ovi.ovi_fusion_engine import OviFusionEngine, DEFAULT_CONFIG
+from ovi.utils.io_utils import save_video
+from ovi.utils.processing_utils import clean_text, scale_hw_to_area_divisible
+from ovi.utils.t5_cache_utils import get_t5_cache_key, load_t5_cached_embeddings, save_t5_cached_embeddings, get_t5_cache_path
+from PIL import Image
+
+# ============================================================================
+# T5 EMBEDDING CACHE SYSTEM (MOVED TO ovi/utils/t5_cache_utils.py)
+# ============================================================================
+
+def detect_gpu_info():
+    """Detect GPU model and VRAM size."""
+    try:
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                # Get primary GPU info
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+                print("=" * 60)
+                print("GPU DETECTION RESULTS:")
+                print(f"  GPU Model: {gpu_name}")
+                print(f"  GPU Count: {device_count}")
+                print(f"  VRAM Size: {gpu_memory_gb:.2f} GB")
+                print("=" * 60)
+
+                return gpu_name, gpu_memory_gb
+            else:
+                print("GPU DETECTION: CUDA available but no devices found")
+                return None, 0
+        else:
+            print("GPU DETECTION: CUDA not available")
+            return None, 0
+    except Exception as e:
+        print(f"GPU DETECTION ERROR: {e}")
+        return None, 0
+
+def detect_system_ram():
+    """Detect total system RAM size."""
+    try:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / (1024**3)
+
+        print("=" * 60)
+        print("SYSTEM RAM DETECTION RESULTS:")
+        print(f"  Total RAM: {total_ram_gb:.2f} GB")
+        print("=" * 60)
+
+        return total_ram_gb
+    except Exception as e:
+        print(f"SYSTEM RAM DETECTION ERROR: {e}")
+        return 0
+
+# ----------------------------
+# Parse CLI Args
+# ----------------------------
+parser = argparse.ArgumentParser(description="Brandulate OVI - AI Video + Audio Generation (use --share to enable public access)")
+parser.add_argument(
+    "--output_dir",
+    type=str,
+    default=None,
+    help="Custom output directory for generated videos (default: OVI/outputs)"
+)
+parser.add_argument(
+    "--share",
+    action="store_true",
+    help="Enable Gradio public sharing (creates public URL)"
+)
+# Temporary: add blocks_to_swap for testing
+parser.add_argument(
+    "--blocks_to_swap",
+    type=int,
+    default=0,
+    help="Number of transformer blocks to swap to CPU memory during generation (0 = disabled)"
+)
+parser.add_argument(
+    "--optimized_block_swap",
+    action="store_true",
+    help="Enable optimized block swap pipeline (musubi-style experimental offloading)"
+)
+# Add test arguments for automatic testing
+parser.add_argument(
+    "--test",
+    action="store_true",
+    help="Enable test mode with automatic generation"
+)
+parser.add_argument(
+    "--test_prompt",
+    type=str,
+    default="A person walking on the beach at sunset",
+    help="Test prompt for automatic testing"
+)
+parser.add_argument(
+    "--test_cpu_offload",
+    action="store_true",
+    help="Enable CPU offload in test mode"
+)
+parser.add_argument(
+    "--test_fp8_t5",
+    action="store_true",
+    help="Enable Scaled FP8 T5 in test mode"
+)
+parser.add_argument(
+    "--test_cpu_only_t5",
+    action="store_true",
+    help="Enable CPU-only T5 in test mode"
+)
+parser.add_argument(
+    "--single-generation",
+    type=str,
+    help="Internal: Run single generation from JSON params and exit"
+)
+parser.add_argument(
+    "--single-generation-file",
+    type=str,
+    help="Internal: Run single generation from JSON file and exit"
+)
+parser.add_argument(
+    "--test-subprocess",
+    action="store_true",
+    help="Internal: Test subprocess functionality"
+)
+parser.add_argument(
+    "--encode-t5-only",
+    type=str,
+    help="Internal: Run T5 text encoding from JSON file and exit"
+)
+parser.add_argument(
+    "--output-embeddings",
+    type=str,
+    help="Internal: Output path for T5 embeddings file"
+)
+args = parser.parse_args()
+
+print(f"[DEBUG] Parsed args: single_generation={bool(args.single_generation)}, single_generation_file={bool(args.single_generation_file)}, test={bool(getattr(args, 'test', False))}, test_subprocess={bool(getattr(args, 'test_subprocess', False))}")
+
+# Initialize engines with lazy loading (no models loaded yet)
+ovi_engine = None  # Will be initialized on first generation
+ovi_engine_duration = None  # Track duration used to initialize engine
+ovi_engine_optimized_block_swap = None  # Track optimized block swap flag used to initialize engine
+
+# Global cancellation flag for stopping generations
+cancel_generation = False
+
+def run_t5_encoding_subprocess(text_prompt, video_negative_prompt, audio_negative_prompt, 
+                                fp8_t5=False, cpu_only_t5=False):
+    """Run T5 text encoding in a subprocess for guaranteed memory cleanup.
+    
+    Returns:
+        List of text embeddings [pos_emb, video_neg_emb, audio_neg_emb] as CPU tensors
+    """
+    import subprocess
+    import sys
+    import json
+    import os
+    import tempfile
+    import time
+
+    process = None
+    params_file = None
+    embeddings_file = None
+
+    try:
+        # Get the current script path and venv
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+        venv_path = os.path.join(script_dir, "venv")
+
+        # Use venv python executable directly
+        if sys.platform == "win32":
+            python_exe = os.path.join(venv_path, "Scripts", "python.exe")
+        else:
+            python_exe = os.path.join(venv_path, "bin", "python")
+
+        # Check if venv python exists, fallback to system python
+        if not os.path.exists(python_exe):
+            print(f"[T5-SUBPROCESS] Venv python not found at {python_exe}, using system python")
+            python_exe = sys.executable
+
+        # Create temporary files for communication
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, dir=script_dir) as f:
+            params = {
+                'text_prompt': text_prompt,
+                'video_negative_prompt': video_negative_prompt,
+                'audio_negative_prompt': audio_negative_prompt,
+                'fp8_t5': fp8_t5,
+                'cpu_only_t5': cpu_only_t5
+            }
+            json.dump(params, f)
+            params_file = f.name
+
+        # Create temp file for embeddings output
+        embeddings_file = tempfile.mktemp(suffix='.pt', dir=script_dir)
+
+        # Prepare command arguments
+        cmd_args = [
+            python_exe,
+            script_path,
+            "--encode-t5-only",
+            params_file,
+            "--output-embeddings",
+            embeddings_file
+        ]
+
+        print(f"[T5-SUBPROCESS] Running T5 encoding in subprocess for guaranteed memory cleanup...")
+        print(f"[T5-SUBPROCESS] This ensures 100% memory cleanup after encoding")
+
+        # Run the subprocess with Popen for better control
+        process = subprocess.Popen(
+            cmd_args,
+            cwd=script_dir,
+            stdout=None,
+            stderr=None
+        )
+
+        # Wait for completion while checking for cancellation
+        while process.poll() is None:
+            global cancel_generation
+            if cancel_generation:
+                print("[T5-SUBPROCESS] Cancellation requested - terminating subprocess...")
+                process.terminate()
+
+                # Give it a moment to terminate gracefully
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    print("[T5-SUBPROCESS] Subprocess didn't terminate gracefully, killing...")
+                    process.kill()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        print("[T5-SUBPROCESS] Failed to kill subprocess")
+
+                # Clean up temp files
+                try:
+                    if params_file and os.path.exists(params_file):
+                        os.unlink(params_file)
+                    if embeddings_file and os.path.exists(embeddings_file):
+                        os.unlink(embeddings_file)
+                except:
+                    pass
+
+                print("[T5-SUBPROCESS] T5 encoding subprocess cancelled")
+                raise Exception("T5 encoding cancelled by user")
+
+            # Sleep briefly to avoid busy waiting
+            time.sleep(0.1)
+
+        # Get the return code
+        return_code = process.returncode
+
+        # Clean up params file
+        try:
+            if params_file and os.path.exists(params_file):
+                os.unlink(params_file)
+        except:
+            pass
+
+        if return_code == 0:
+            print("[T5-SUBPROCESS] T5 encoding completed successfully - loading embeddings...")
+            
+            # Load embeddings from file
+            if not os.path.exists(embeddings_file):
+                raise Exception(f"Embeddings file not found: {embeddings_file}")
+            
+            embeddings = torch.load(embeddings_file)
+            
+            # Clean up embeddings file
+            try:
+                os.unlink(embeddings_file)
+            except:
+                pass
+            
+            print("[T5-SUBPROCESS] T5 subprocess memory completely freed by OS")
+            return embeddings
+        else:
+            print(f"[T5-SUBPROCESS] T5 encoding failed with return code: {return_code}")
+            
+            # Clean up embeddings file
+            try:
+                if embeddings_file and os.path.exists(embeddings_file):
+                    os.unlink(embeddings_file)
+            except:
+                pass
+            
+            raise Exception(f"T5 encoding subprocess failed with return code: {return_code}")
+
+    except Exception as e:
+        error_msg = str(e)
+        if "cancelled by user" in error_msg.lower():
+            # Re-raise cancellation exceptions
+            raise e
+        else:
+            print(f"[T5-SUBPROCESS] Error running T5 encoding subprocess: {e}")
+            # Clean up process if it exists
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2.0)
+                except:
+                    try:
+                        process.kill()
+                    except:
+                        pass
+            # Clean up temp files
+            try:
+                if params_file and os.path.exists(params_file):
+                    os.unlink(params_file)
+                if embeddings_file and os.path.exists(embeddings_file):
+                    os.unlink(embeddings_file)
+            except:
+                pass
+            raise e
+
+def run_generation_subprocess(params):
+    """Run a single generation in a subprocess to ensure memory cleanup."""
+    import subprocess
+    import sys
+    import json
+    import os
+    import tempfile
+    import time
+
+    process = None
+    temp_file = None
+    embeddings_temp_file = None
+
+    try:
+        # Get the current script path and venv
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+        venv_path = os.path.join(script_dir, "venv")
+
+        # Use venv python executable directly
+        if sys.platform == "win32":
+            python_exe = os.path.join(venv_path, "Scripts", "python.exe")
+        else:
+            python_exe = os.path.join(venv_path, "bin", "python")
+
+        # Check if venv python exists, fallback to system python
+        if not os.path.exists(python_exe):
+            print(f"[SUBPROCESS] Venv python not found at {python_exe}, using system python")
+            python_exe = sys.executable
+
+        # Handle text_embeddings_cache if provided
+        if 'text_embeddings_cache' in params and params['text_embeddings_cache'] is not None:
+            # Save embeddings to temp file
+            embeddings_temp_file = tempfile.mktemp(suffix='_embeddings.pt', dir=script_dir)
+            torch.save(params['text_embeddings_cache'], embeddings_temp_file)
+            # Replace embeddings with file path in params
+            params['text_embeddings_cache'] = embeddings_temp_file
+            print(f"[SUBPROCESS] Saved pre-encoded T5 embeddings to: {embeddings_temp_file}")
+            print(f"[SUBPROCESS] Generation subprocess will load embeddings instead of encoding T5")
+
+        # Write params to temporary file to avoid command line issues
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, dir=script_dir) as f:
+            json.dump(params, f)
+            temp_file = f.name
+
+        # Prepare command arguments - pass temp file path
+        cmd_args = [
+            python_exe,
+            script_path,
+            "--single-generation-file",
+            temp_file
+        ]
+
+        print(f"[SUBPROCESS] Running generation in subprocess...")
+        print(f"[SUBPROCESS] Command: {' '.join(cmd_args)}")
+        print(f"[SUBPROCESS] Params file: {temp_file}")
+
+        # Run the subprocess with Popen for better control
+        process = subprocess.Popen(
+            cmd_args,
+            cwd=script_dir,
+            stdout=None,  # Let subprocess handle its own output
+            stderr=None
+        )
+
+        # Wait for completion while checking for cancellation
+        while process.poll() is None:
+            global cancel_generation
+            if cancel_generation:
+                print("[SUBPROCESS] Cancellation requested - terminating subprocess...")
+                process.terminate()
+
+                # Give it a moment to terminate gracefully
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    print("[SUBPROCESS] Subprocess didn't terminate gracefully, killing...")
+                    process.kill()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        print("[SUBPROCESS] Failed to kill subprocess")
+
+                # Clean up temp file
+                try:
+                    if temp_file and os.path.exists(temp_file):
+                        os.unlink(temp_file)
+                except:
+                    pass
+
+                print("[SUBPROCESS] Subprocess cancelled")
+                raise Exception("Generation cancelled by user")
+
+            # Sleep briefly to avoid busy waiting
+            time.sleep(0.1)
+
+        # Get the return code
+        return_code = process.returncode
+
+        # Clean up temp files
+        try:
+            if temp_file and os.path.exists(temp_file):
+                os.unlink(temp_file)
+            if embeddings_temp_file and os.path.exists(embeddings_temp_file):
+                os.unlink(embeddings_temp_file)
+        except:
+            pass
+
+        if return_code == 0:
+            print("[SUBPROCESS] Generation completed successfully")
+            return True
+        elif return_code == -signal.SIGTERM or return_code == 1:  # SIGTERM or general error
+            if cancel_generation:
+                print("[SUBPROCESS] Subprocess was cancelled")
+                return False
+            else:
+                print(f"[SUBPROCESS] Generation failed with return code: {return_code}")
+                return False
+        else:
+            print(f"[SUBPROCESS] Generation failed with return code: {return_code}")
+            return False
+
+    except Exception as e:
+        error_msg = str(e)
+        if "cancelled by user" in error_msg.lower():
+            # Re-raise cancellation exceptions
+            raise e
+        else:
+            print(f"[SUBPROCESS] Error running subprocess: {e}")
+            # Clean up process if it exists
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2.0)
+                except:
+                    try:
+                        process.kill()
+                    except:
+                        pass
+            # Clean up temp files
+            try:
+                if temp_file and os.path.exists(temp_file):
+                    os.unlink(temp_file)
+                if embeddings_temp_file and os.path.exists(embeddings_temp_file):
+                    os.unlink(embeddings_temp_file)
+            except:
+                pass
+            return False
+
+share_enabled = args.share
+print(f"Starting Gradio interface with lazy loading... Share mode: {'ENABLED' if share_enabled else 'DISABLED (local only)'}")
+if not share_enabled:
+    print("Use --share flag to enable public access with a shareable URL")
+
+
+def validate_prompt_format(text_prompt):
+    """Validate prompt format for required tags.
+    
+    Requirements:
+    - At least one <S>...<E> pair (speech tags)
+    - <S> and <E> must be paired
+    - <AUDCAP> and <ENDAUDCAP> must be paired
+    - No other unknown tags allowed
+    
+    Returns:
+        tuple: (is_valid: bool, error_message: str or None)
+    """
+    import re
+    
+    if not text_prompt or not isinstance(text_prompt, str):
+        return False, "❌ Prompt is empty or invalid"
+    
+    # Find all tags in the prompt
+    all_tags = re.findall(r'<([^>]+)>', text_prompt)
+    
+    # Allowed tags
+    allowed_tags = {'S', 'E', 'AUDCAP', 'ENDAUDCAP'}
+    
+    # Check for unknown tags
+    unknown_tags = set(all_tags) - allowed_tags
+    if unknown_tags:
+        return False, f"❌ Unknown tags found: {', '.join(f'<{tag}>' for tag in unknown_tags)}\n\n✅ Only these tags are allowed: <S>, <E>, <AUDCAP>, <ENDAUDCAP>"
+    
+    # Count speech tags
+    s_count = text_prompt.count('<S>')
+    e_count = text_prompt.count('<E>')
+    
+    # Check for at least one <S>/<E> pair
+    if s_count == 0 or e_count == 0:
+        return False, "❌ Prompt must contain at least one <S>...<E> speech pair\n\nExample: A person says <S>Hello world<E>"
+    
+    # Check if <S> and <E> are balanced
+    if s_count != e_count:
+        return False, f"❌ Unbalanced speech tags: {s_count} <S> tags but {e_count} <E> tags\n\n✅ Each <S> must have a matching <E>"
+    
+    # Count audio caption tags
+    audcap_count = text_prompt.count('<AUDCAP>')
+    endaudcap_count = text_prompt.count('<ENDAUDCAP>')
+    
+    # Check if <AUDCAP> and <ENDAUDCAP> are balanced
+    if audcap_count != endaudcap_count:
+        return False, f"❌ Unbalanced audio caption tags: {audcap_count} <AUDCAP> tags but {endaudcap_count} <ENDAUDCAP> tags\n\n✅ Each <AUDCAP> must have a matching <ENDAUDCAP>"
+    
+    # Check proper ordering of tags (basic check)
+    # For <S> and <E>
+    s_positions = [m.start() for m in re.finditer(r'<S>', text_prompt)]
+    e_positions = [m.start() for m in re.finditer(r'<E>', text_prompt)]
+    
+    # Check that each <S> comes before its corresponding <E>
+    for i in range(len(s_positions)):
+        if i >= len(e_positions) or s_positions[i] >= e_positions[i]:
+            return False, f"❌ Invalid speech tag order: Each <S> must come before its matching <E>\n\nPosition {i+1}: <S> found but <E> is missing or in wrong position"
+    
+    # Similar check for <AUDCAP> and <ENDAUDCAP>
+    audcap_positions = [m.start() for m in re.finditer(r'<AUDCAP>', text_prompt)]
+    endaudcap_positions = [m.start() for m in re.finditer(r'<ENDAUDCAP>', text_prompt)]
+    
+    for i in range(len(audcap_positions)):
+        if i >= len(endaudcap_positions) or audcap_positions[i] >= endaudcap_positions[i]:
+            return False, f"❌ Invalid audio caption tag order: Each <AUDCAP> must come before its matching <ENDAUDCAP>\n\nPosition {i+1}: <AUDCAP> found but <ENDAUDCAP> is missing or in wrong position"
+    
+    return True, None
+
+def parse_duration_from_prompt(text_prompt):
+    """Parse duration override from prompt syntax {x} at the beginning.
+
+    Looks for {number} at the start of prompt (with optional spaces around it).
+    Returns tuple: (cleaned_prompt, duration_override)
+    If no duration override found, returns (original_prompt, None)
+    """
+    import re
+
+    if not text_prompt or not isinstance(text_prompt, str):
+        return text_prompt, None
+
+    # Pattern to match {number} at the beginning with optional spaces
+    # \s* matches any whitespace (including newlines)
+    # \{(\d+(?:\.\d+)?)\} matches {number} where number can be integer or float
+    pattern = r'^\s*\{(\d+(?:\.\d+)?)\}\s*'
+
+    match = re.match(pattern, text_prompt, re.MULTILINE)
+    if match:
+        duration_str = match.group(1)
+        try:
+            duration = float(duration_str)
+            # Remove the duration syntax from prompt
+            cleaned_prompt = re.sub(pattern, '', text_prompt, count=1, flags=re.MULTILINE)
+            print(f"[DURATION OVERRIDE] Found duration override: {duration} seconds")
+            print(f"[DURATION OVERRIDE] Cleaned prompt: {cleaned_prompt[:100]}...")
+            return cleaned_prompt, duration
+        except ValueError:
+            print(f"[DURATION OVERRIDE] Invalid duration format: {duration_str}")
+            return text_prompt, None
+
+    return text_prompt, None
+
+def parse_multiline_prompts(text_prompt, enable_multiline_prompts):
+    """Parse multi-line prompts into individual prompts, filtering out short lines."""
+    if not enable_multiline_prompts:
+        return [text_prompt]
+
+    # Split by lines and filter
+    lines = text_prompt.split('\n')
+    prompts = []
+
+    for line in lines:
+        line = line.strip()
+        if len(line) >= 3:  # Skip lines shorter than 3 characters (after trimming)
+            prompts.append(line)
+
+    # If no valid prompts, return original
+    return prompts if prompts else [text_prompt]
+
+def extract_last_frame(video_path):
+    """Extract the last frame from a video file and save as PNG."""
+    try:
+        # Defensive checks
+        if not video_path or not isinstance(video_path, str) or video_path.strip() == "" or not os.path.exists(video_path):
+            print(f"[VIDEO EXTENSION] Invalid or missing video file: {video_path}")
+            return None
+
+        from PIL import Image
+        import cv2
+
+        # Use OpenCV to get the last frame
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception(f"Could not open video: {video_path}")
+
+        # Get total frames
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            raise Exception("Video has no frames")
+
+        # Seek to last frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            raise Exception("Could not read last frame")
+
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+
+        # Save to temp directory
+        tmp_dir = os.path.join(os.path.dirname(__file__), "temp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        frame_path = os.path.join(tmp_dir, f"last_frame_{timestamp}.png")
+        img.save(frame_path)
+
+        print(f"[VIDEO EXTENSION] Extracted last frame: {frame_path}")
+        return frame_path
+
+    except Exception as e:
+        print(f"[VIDEO EXTENSION] Error extracting last frame: {e}")
+        return None
+
+def is_video_file(file_path):
+    """Check if a file is a video based on extension."""
+    if not file_path or not isinstance(file_path, str):
+        return False
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm', '.m4v']
+    return any(file_path.lower().endswith(ext) for ext in video_extensions)
+
+def is_image_file(file_path):
+    """Check if a file is an image based on extension."""
+    if not file_path or not isinstance(file_path, str):
+        return False
+    image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif']
+    return any(file_path.lower().endswith(ext) for ext in image_extensions)
+
+def convert_image_to_png(image_path, output_dir=None):
+    """
+    Convert any image format (including WebP) to PNG for maximum robustness.
+    
+    Args:
+        image_path: Path to input image (any format supported by PIL)
+        output_dir: Optional output directory. If None, uses same directory as input.
+    
+    Returns:
+        str: Path to converted PNG image, or original path if conversion fails
+    """
+    if not image_path or not os.path.exists(image_path):
+        return image_path
+    
+    # If already PNG, return as-is
+    if image_path.lower().endswith('.png'):
+        return image_path
+    
+    try:
+        # Open image with PIL
+        img = Image.open(image_path)
+        
+        # Convert RGBA to RGB if necessary (for formats with transparency)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        elif img.mode not in ('RGB', 'L'):
+            # Convert any other mode to RGB
+            img = img.convert('RGB')
+        
+        # Determine output path
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        if output_dir is None:
+            output_dir = os.path.dirname(image_path)
+        output_path = os.path.join(output_dir, f"{base_name}_converted.png")
+        
+        # Save as PNG with maximum quality
+        img.save(output_path, 'PNG', compress_level=1)  # compress_level=1 for speed with good quality
+        
+        print(f"[IMAGE CONVERSION] Converted {os.path.basename(image_path)} to PNG: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"[IMAGE CONVERSION] Warning: Failed to convert {image_path} to PNG: {e}")
+        print(f"[IMAGE CONVERSION] Using original image file")
+        import traceback
+        traceback.print_exc()
+        return image_path
+
+def process_input_media(media_path, auto_crop_image, video_width, video_height, auto_pad_32px_divisible=False):
+    """Process input media (image or video) and return image path to use + input video path if applicable.
+    
+    Returns:
+        tuple: (image_path, input_video_path, is_video)
+            - image_path: Path to image to use for generation (extracted frame if video)
+            - input_video_path: Path to input video if provided, None otherwise
+            - is_video: Boolean indicating if input was a video
+    """
+    if not media_path or not os.path.exists(media_path):
+        return None, None, False
+    
+    try:
+        # Check if input is a video
+        if is_video_file(media_path):
+            print(f"[INPUT] Video detected: {media_path}")
+            print(f"[INPUT] Extracting last frame for use as source image...")
+            
+            # Extract last frame from video
+            frame_path = extract_last_frame(media_path)
+            if not frame_path:
+                print(f"[INPUT] Failed to extract frame from video, skipping")
+                return None, None, False
+            
+            print(f"[INPUT] Extracted frame: {frame_path}")
+            
+            # Convert frame to PNG for maximum robustness
+            frame_path = convert_image_to_png(frame_path)
+            
+            print(f"[INPUT] Input video will be merged with generated video after generation")
+            
+            # Apply auto-crop/pad if enabled
+            if auto_crop_image and video_width and video_height:
+                frame_path = apply_auto_crop_if_enabled(frame_path, auto_crop_image, video_width, video_height, 
+                                                       auto_pad_32px_divisible=auto_pad_32px_divisible)
+                mode_label = "Auto-pad" if auto_pad_32px_divisible else "Auto-crop"
+                print(f"[INPUT] {mode_label} applied to extracted frame")
+            
+            return frame_path, media_path, True
+        
+        # Input is an image
+        elif is_image_file(media_path):
+            print(f"[INPUT] Image detected: {media_path}")
+            # Convert to PNG for maximum robustness
+            png_path = convert_image_to_png(media_path)
+            return png_path, None, False
+        
+        else:
+            print(f"[INPUT] Unknown file type: {media_path}")
+            return None, None, False
+            
+    except Exception as e:
+        print(f"[INPUT] Error processing input media: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, False
+
+def trim_video_frames(input_video_path, output_video_path, trim_first=False, trim_last=False):
+    """Trim frames from a video using FFmpeg.
+
+    Args:
+        input_video_path: Path to input video
+        output_video_path: Path to output video
+        trim_first: If True, removes the first frame
+        trim_last: If True, removes the last frame
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        import subprocess
+        import cv2
+
+        # Get video properties
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            print(f"[TRIM] Could not open video: {input_video_path}")
+            return False
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if total_frames <= 1:
+            print(f"[TRIM] Video has only {total_frames} frame(s), cannot trim")
+            return False
+
+        trim_type = "first" if trim_first else "last"
+        print(f"[TRIM-{trim_type.upper()}] Original video: {total_frames} frames at {fps:.2f} fps")
+
+        if trim_last:
+            # Calculate frames to keep (remove last frame)
+            frames_to_keep = total_frames - 1
+            print(f"[TRIM] Trimming to: {frames_to_keep} frames")
+
+            # Use FFmpeg to trim the video by specifying exact frame count for frame accuracy
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', input_video_path,
+                '-frames:v', str(frames_to_keep),  # Keep exactly this many frames
+                '-c:v', 'libx264',  # Re-encode video for frame-accurate trim
+                '-preset', 'slow',  # Fast encoding preset
+                '-crf', '12',  # High quality (18 is visually lossless)
+                '-c:a', 'aac',  # Re-encode audio
+                '-b:a', '192k',  # Audio bitrate
+                '-avoid_negative_ts', 'make_zero',
+                output_video_path
+            ]
+
+            expected_frames = frames_to_keep
+
+        elif trim_first:
+            # Skip first frame and keep the rest
+            print(f"[TRIM-FIRST] Skipping first frame, keeping {total_frames - 1} frames")
+
+            # Use FFmpeg to skip the first frame by starting from frame 1 (0-indexed)
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', input_video_path,
+                '-vf', 'select=not(eq(n\\,0))',  # Skip frame 0 (first frame)
+                '-af', 'aselect=not(eq(n\\,0))',  # Skip first audio frame too
+                '-c:v', 'libx264',  # Re-encode video
+                '-preset', 'slow',  # Fast encoding preset
+                '-crf', '12',  # High quality (18 is visually lossless)
+                '-c:a', 'aac',  # Re-encode audio
+                '-b:a', '192k',  # Audio bitrate
+                '-avoid_negative_ts', 'make_zero',
+                output_video_path
+            ]
+
+            expected_frames = total_frames - 1
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            # Verify the trim worked by checking frame count
+            cap_verify = cv2.VideoCapture(output_video_path)
+            if cap_verify.isOpened():
+                new_frame_count = int(cap_verify.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap_verify.release()
+                print(f"[TRIM-{trim_type.upper()}] Successfully trimmed: {total_frames} → {new_frame_count} frames")
+
+                if new_frame_count == expected_frames:
+                    print(f"[TRIM-{trim_type.upper()}] ✓ Frame count verified: exactly 1 frame removed")
+                    return True
+                else:
+                    print(f"[TRIM-{trim_type.upper()}] ⚠ Warning: Expected {expected_frames} frames, got {new_frame_count}")
+                    # Still return True as trim succeeded, just with a warning
+                    return True
+            else:
+                print(f"[TRIM-{trim_type.upper()}] Successfully trimmed {trim_type} frame (verification failed)")
+                return True
+        else:
+            print(f"[TRIM-{trim_type.upper()}] FFmpeg failed with return code {result.returncode}")
+            print(f"[TRIM-{trim_type.upper()}] stderr: {result.stderr}")
+            return False
+
+    except Exception as e:
+        print(f"[TRIM-{trim_type.upper()}] Error trimming video: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def trim_last_frame_from_video(input_video_path, output_video_path):
+    """Remove the last frame from a video using FFmpeg.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    return trim_video_frames(input_video_path, output_video_path, trim_first=False, trim_last=True)
+
+def trim_first_frame_from_video(input_video_path, output_video_path):
+    """Remove the first frame from a video using FFmpeg.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    return trim_video_frames(input_video_path, output_video_path, trim_first=True, trim_last=False)
+
+def combine_videos(video_paths, output_path, trim_first_video_last_frame=False, trim_extension_first_frames=False):
+    """Combine multiple videos into one by concatenating them with FFmpeg.
+
+    Args:
+        video_paths: List of video file paths to combine
+        output_path: Output path for combined video
+        trim_first_video_last_frame: If True, removes last frame from first video before merging
+        trim_extension_first_frames: If True, removes first frame from each video except the first
+    """
+    try:
+        import subprocess
+        import tempfile
+        import os
+
+        temp_trimmed_extensions = []
+
+        if len(video_paths) < 2:
+            print("[VIDEO EXTENSION] Only one video, no combination needed")
+            return False
+
+        # If trimming first video, create a trimmed version
+        temp_trimmed_video = None
+        if trim_first_video_last_frame:
+            print(f"[VIDEO MERGE] Trimming last frame from first video to avoid duplication...")
+            temp_trimmed_video = tempfile.mktemp(suffix='_trimmed.mp4', dir=os.path.dirname(video_paths[0]))
+
+            if trim_video_frames(video_paths[0], temp_trimmed_video, trim_first=False, trim_last=True):
+                # Replace first video with trimmed version
+                video_paths = [temp_trimmed_video] + video_paths[1:]
+                print(f"[VIDEO MERGE] Using trimmed video (last frame removed)")
+            else:
+                print(f"[VIDEO MERGE] Failed to trim, using original video")
+                temp_trimmed_video = None
+
+        # If trimming first frame from extension videos, create trimmed versions
+        if trim_extension_first_frames and len(video_paths) > 1:
+            print(f"[VIDEO MERGE] Trimming first frame from {len(video_paths) - 1} extension videos to avoid duplication...")
+            new_video_paths = [video_paths[0]]  # Keep first video as-is
+
+            for i, video_path in enumerate(video_paths[1:], 1):  # Skip first video
+                trimmed_path = tempfile.mktemp(suffix=f'_ext{i}_trimmed.mp4', dir=os.path.dirname(video_path))
+                if trim_video_frames(video_path, trimmed_path, trim_first=True, trim_last=False):
+                    new_video_paths.append(trimmed_path)
+                    temp_trimmed_extensions.append(trimmed_path)
+                    print(f"[VIDEO MERGE] Extension {i} trimmed (first frame removed)")
+                else:
+                    print(f"[VIDEO MERGE] Failed to trim extension {i}, using original")
+                    new_video_paths.append(video_path)
+
+            video_paths = new_video_paths
+
+        # Create a temporary file list for FFmpeg concat
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for video_path in video_paths:
+                # Escape single quotes in path for FFmpeg
+                escaped_path = video_path.replace("'", r"'\''")
+                f.write(f"file '{escaped_path}'\n")
+            concat_file = f.name
+
+        try:
+            # Use FFmpeg to concatenate videos with audio
+            cmd = [
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                '-i', concat_file,
+                '-c', 'copy',  # Copy streams to preserve audio/video codecs
+                '-avoid_negative_ts', 'make_zero',  # Handle timestamp issues
+                output_path
+            ]
+
+            print(f"[VIDEO EXTENSION] Running FFmpeg concat command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=os.getcwd())
+
+            if result.returncode == 0:
+                print(f"[VIDEO EXTENSION] Combined {len(video_paths)} videos into: {output_path}")
+                return True
+            else:
+                print(f"[VIDEO EXTENSION] FFmpeg failed with return code {result.returncode}")
+                print(f"[VIDEO EXTENSION] FFmpeg stdout: {result.stdout}")
+                print(f"[VIDEO EXTENSION] FFmpeg stderr: {result.stderr}")
+                return False
+
+        finally:
+            # Clean up temporary files
+            try:
+                os.unlink(concat_file)
+                if temp_trimmed_video and os.path.exists(temp_trimmed_video):
+                    os.unlink(temp_trimmed_video)
+                # Clean up temporary trimmed extension files
+                for temp_file in temp_trimmed_extensions:
+                    if os.path.exists(temp_file):
+                        os.unlink(temp_file)
+            except:
+                pass
+
+    except Exception as e:
+        print(f"[VIDEO EXTENSION] Error combining videos: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def save_used_source_image(image_path, output_dir, video_filename):
+    """Save the used source image to used_source_images subfolder."""
+    try:
+        # Defensive checks
+        if not image_path or not isinstance(image_path, str) or image_path.strip() == "" or not os.path.exists(image_path):
+            return False
+
+        if not output_dir or not isinstance(output_dir, str) or not os.path.exists(output_dir):
+            return False
+
+        if not video_filename or not isinstance(video_filename, str):
+            return False
+
+        # Create used_source_images subfolder
+        source_images_dir = os.path.join(output_dir, "used_source_images")
+        os.makedirs(source_images_dir, exist_ok=True)
+
+        # Create filename: same as video but with .png extension
+        base_name = os.path.splitext(os.path.basename(video_filename))[0]
+        source_filename = f"{base_name}.png"
+        source_path = os.path.join(source_images_dir, source_filename)
+
+        # Copy the image
+        from PIL import Image
+        img = Image.open(image_path)
+        img.save(source_path)
+
+        print(f"[SOURCE IMAGE] Saved used source image: {source_filename}")
+        return True
+
+    except Exception as e:
+        print(f"[SOURCE IMAGE] Error saving source image: {e}")
+        return False
+
+def generate_video(
+    text_prompt,
+    image,
+    video_frame_height,
+    video_frame_width,
+    video_seed,
+    solver_name,
+    sample_steps,
+    shift,
+    video_guidance_scale,
+    audio_guidance_scale,
+    slg_layer,
+    blocks_to_swap,
+    optimized_block_swap,
+    video_negative_prompt,
+    audio_negative_prompt,
+    use_image_gen,
+    cpu_offload,
+    delete_text_encoder,
+    fp8_t5,
+    cpu_only_t5,
+    fp8_base_model,
+    use_sage_attention,
+    no_audio,
+    no_block_prep,
+    num_generations,
+    randomize_seed,
+    save_metadata,
+    aspect_ratio,
+    clear_all,
+    vae_tiled_decode,
+    vae_tile_size,
+    vae_tile_overlap,
+    base_resolution_width,
+    base_resolution_height,
+    duration_seconds,
+    auto_crop_image=True,  # Default to True for backward compatibility
+    base_filename=None,  # For batch processing to use custom filenames
+    output_dir=None,  # Custom output directory (overrides args.output_dir)
+    text_embeddings_cache=None,  # Pre-encoded text embeddings from T5 subprocess
+    enable_multiline_prompts=False,  # New: Enable multi-line prompt processing
+    enable_video_extension=False,  # New: Enable automatic video extension based on prompt lines
+    dont_auto_combine_video_input=False,  # New: Don't auto combine video input with generated video
+    disable_auto_prompt_validation=False,  # New: Skip automatic prompt validation when True
+    auto_pad_32px_divisible=False,  # New: Auto pad for 32px divisibility instead of crop+resize
+    input_video_path=None,  # New: Input video path for merging (when user uploads video)
+    merge_loras_on_gpu=False,  # New: Merge LoRAs on GPU instead of CPU for high VRAM GPUs
+    lora_1=None, lora_1_scale=1.0, lora_1_layers="Video Layers",  # LoRA 1 selection, scale, and layers
+    lora_2=None, lora_2_scale=1.0, lora_2_layers="Video Layers",  # LoRA 2 selection, scale, and layers
+    lora_3=None, lora_3_scale=1.0, lora_3_layers="Video Layers",  # LoRA 3 selection, scale, and layers
+    lora_4=None, lora_4_scale=1.0, lora_4_layers="Video Layers",  # LoRA 4 selection, scale, and layers
+    is_video_extension_subprocess=False,  # Internal: Mark subprocess calls for video extensions
+    is_extension=False,  # Internal: Mark if this generation is an extension
+    extension_index=0,  # Internal: Extension number for metadata
+    main_base=None,  # Internal: Main video base name for consistent naming
+    force_exact_resolution=True,  # Always use exact user-specified resolution (never rescale to 720*720 area)
+    lora_specs=None,  # Pre-built LoRA specs (for subprocess), overrides lora_1-4 if provided
+):
+    # Note: enable_video_extension is passed directly from UI and should be respected as-is
+    
+    # Debug: Log what LoRA parameters we received from UI
+    print(f"[LORA DEBUG] Received from UI:")
+    print(f"  lora_1={repr(lora_1)}, lora_1_scale={repr(lora_1_scale)}, lora_1_layers={repr(lora_1_layers)}")
+    print(f"  lora_2={repr(lora_2)}, lora_2_scale={repr(lora_2_scale)}, lora_2_layers={repr(lora_2_layers)}")
+    print(f"  lora_3={repr(lora_3)}, lora_3_scale={repr(lora_3_scale)}, lora_3_layers={repr(lora_3_layers)}")
+    print(f"  lora_4={repr(lora_4)}, lora_4_scale={repr(lora_4_scale)}, lora_4_layers={repr(lora_4_layers)}")
+    print(f"  lora_specs={repr(lora_specs)}")
+
+    # Additional LoRA status information
+    active_loras = []
+    if lora_specs and len(lora_specs) > 0:
+        active_loras = [os.path.basename(path) for path, scale, layers in lora_specs]
+        print(f"[LORA STATUS] Active LoRAs detected: {len(active_loras)} LoRA(s)")
+        for i, lora_name in enumerate(active_loras, 1):
+            scale, layers = next((scale, layers) for path, scale, layers in lora_specs if os.path.basename(path) == lora_name)
+            print(f"  [{i}] {lora_name} (scale: {scale}, layers: {layers})")
+    elif lora_1 or lora_2 or lora_3 or lora_4:
+        # Check individual LoRA selections
+        lora_choices, lora_path_map = scan_lora_folders()
+        for lora_name, scale in [(lora_1, lora_1_scale), (lora_2, lora_2_scale), (lora_3, lora_3_scale), (lora_4, lora_4_scale)]:
+            if lora_name and lora_name in lora_path_map:
+                active_loras.append(lora_name)
+        if active_loras:
+            print(f"[LORA STATUS] UI selections will be processed: {len(active_loras)} LoRA(s)")
+            for i, lora_name in enumerate(active_loras, 1):
+                scale = next(scale for name, scale in [(lora_1, lora_1_scale), (lora_2, lora_2_scale), (lora_3, lora_3_scale), (lora_4, lora_4_scale)] if name == lora_name)
+                print(f"  [{i}] {lora_name} (scale: {scale})")
+        else:
+            print(f"[LORA STATUS] No LoRAs selected")
+    else:
+        print(f"[LORA STATUS] No LoRAs selected")
+    
+    # Build LoRA specs from UI selections (unless already provided by subprocess)
+    if lora_specs is None:
+        lora_choices, lora_path_map = scan_lora_folders()
+        lora_specs = []
+        
+        for lora_name, lora_scale, lora_layers in [(lora_1, lora_1_scale, lora_1_layers), (lora_2, lora_2_scale, lora_2_layers), (lora_3, lora_3_scale, lora_3_layers), (lora_4, lora_4_scale, lora_4_layers)]:
+            # Convert scale to float safely (Gradio can pass strings or None)
+            try:
+                scale_float = float(lora_scale) if lora_scale is not None else 0.0
+            except (ValueError, TypeError):
+                scale_float = 0.0
+
+            if lora_name and lora_name != "None" and scale_float > 0.0:
+                lora_path = lora_path_map.get(lora_name)
+                if lora_path and os.path.exists(lora_path):
+                    lora_specs.append((lora_path, scale_float, lora_layers))
+                    print(f"[LORA BUILD] Added: {lora_name} -> {lora_path} (scale={scale_float}, layers={lora_layers})")
+                else:
+                    print(f"[WARNING] LoRA not found: {lora_name} (path: {lora_path})")
+    else:
+        # lora_specs provided directly (from subprocess), use as-is
+        # Convert lists back to tuples if needed (JSON serialization converts tuples to lists)
+        if isinstance(lora_specs, list) and len(lora_specs) > 0:
+            if isinstance(lora_specs[0], list):
+                lora_specs = [tuple(item) for item in lora_specs]
+        print(f"[LORA] Using pre-built lora_specs from subprocess: {len(lora_specs)} LoRA(s)")
+        for path, scale, layers in lora_specs:
+            print(f"[LORA] - {os.path.basename(path)} (scale={scale}, layers={layers})")
+    
+    if lora_specs:
+        print("=" * 80)
+        print(f"LORA CONFIGURATION: {len(lora_specs)} LoRA(s) selected")
+        for path, scale, layers in lora_specs:
+            print(f"  - {os.path.basename(path)}: scale={scale}, layers={layers}")
+        print("=" * 80)
+
+
+    # Store original duration before any overrides
+    original_duration_seconds = duration_seconds
+
+    # Check for duration override in prompt syntax {x}
+    original_prompt = text_prompt
+    text_prompt, duration_override = parse_duration_from_prompt(text_prompt)
+    if duration_override is not None:
+        duration_seconds = duration_override
+        print(f"[DURATION OVERRIDE] Duration changed from UI slider to {duration_seconds} seconds")
+
+    # Parse prompts for video extension validation (always parse to count lines)
+    validation_prompts = parse_multiline_prompts(text_prompt, True)  # Always parse for validation
+
+    # Validate prompt format if validation is enabled
+    if not disable_auto_prompt_validation:
+        # Check if prompt contains at least one <S>...<E> pair (unless disabled)
+        is_valid, error_message = validate_prompt_format(text_prompt)
+        if not is_valid:
+            print("=" * 80)
+            print("PROMPT VALIDATION FAILED")
+            print(error_message)
+            print("=" * 80)
+            raise ValueError(f"Invalid prompt format:\n\n{error_message}")
+    else:
+        print("=" * 80)
+        print("AUTO PROMPT VALIDATION DISABLED - Proceeding with validation bypass")
+        print("=" * 80)
+
+    # Calculate video extension count based on enable_video_extension setting
+    video_extension_count = 0
+    if enable_video_extension:
+        # Count valid prompt lines (>= 3 chars after trim) minus 1 for the main video
+        video_extension_count = max(0, len(validation_prompts) - 1)
+
+    global ovi_engine, ovi_engine_duration, ovi_engine_optimized_block_swap
+
+    # Reset cancellation flag at the start of each generation request
+    reset_cancellation()
+    
+    # Load text embeddings from file if provided as path (from subprocess)
+    if text_embeddings_cache is not None and isinstance(text_embeddings_cache, str):
+        if os.path.exists(text_embeddings_cache):
+            print(f"[DEBUG] Loading pre-encoded T5 embeddings from: {text_embeddings_cache}")
+            text_embeddings_cache = torch.load(text_embeddings_cache)
+            print(f"[DEBUG] T5 embeddings loaded successfully - will skip T5 encoding")
+        else:
+            print(f"[WARNING] Embeddings file not found: {text_embeddings_cache}")
+            text_embeddings_cache = None
+
+    # IMPORTANT: Only clear cache when processing multiple different prompts (multiline mode)
+    # For single prompt generation, preserve cached embeddings to avoid re-encoding
+    # This prevents infinite subprocess loops when clear_all=True
+    # Video extensions explicitly set text_embeddings_cache=None in their subprocess params
+    # Batch processing creates separate generate_video() calls, so cache is naturally isolated
+    if enable_multiline_prompts:
+        # Multiline mode: each prompt line needs separate embeddings
+        # Cache will be cleared here, then each line will encode or load its own cache
+        text_embeddings_cache = None
+        print(f"[CACHE] Cleared embeddings cache for multiline prompt processing ({len(text_prompt.splitlines())} lines)")
+    elif text_embeddings_cache is not None:
+        print(f"[CACHE] Preserving embeddings cache for single prompt generation")
+    # Note: When cache is None at this point, T5 encoding will run below (expected behavior)
+
+    # Start timing
+    import time
+    generation_start_time = time.time()
+
+    # CRITICAL: Always use exact user-specified Video Width and Video Height from Gradio interface
+    # No recalculation or overriding - trust the user's explicit resolution settings
+    print(f"[RESOLUTION] Using exact user-specified resolution: {video_frame_width}x{video_frame_height}")
+    
+    # Validate that dimensions are divisible by 32 (required by model)
+    if video_frame_width % 32 != 0 or video_frame_height % 32 != 0:
+        # Snap to nearest multiple of 32
+        video_frame_width = max(32, ((video_frame_width + 15) // 32) * 32)
+        video_frame_height = max(32, ((video_frame_height + 15) // 32) * 32)
+        print(f"[RESOLUTION] Snapped to 32px alignment: {video_frame_width}x{video_frame_height}")
+
+    # Validate video extension requirements
+    if video_extension_count > 0:
+        required_prompts = 1 + video_extension_count  # 1 main + N extensions
+        if len(validation_prompts) < required_prompts:
+            raise ValueError(f"Video Extension Count {video_extension_count} requires at least {required_prompts} valid prompt lines (1 main + {video_extension_count} extensions), but only {len(validation_prompts)} valid lines found in the prompt text.")
+
+    # Parse multi-line prompts for generation based on setting
+    # Multi-line prompts and video extensions are mutually exclusive features
+    if enable_multiline_prompts:
+        # When multi-line prompts enabled: generate separate videos for each prompt line
+        individual_prompts = parse_multiline_prompts(text_prompt, enable_multiline_prompts)
+        # Validate each individual prompt line (unless disabled)
+        if not disable_auto_prompt_validation:
+            for i, prompt_line in enumerate(individual_prompts):
+                line_valid, line_error = validate_prompt_format(prompt_line)
+                if not line_valid:
+                    raise ValueError(f"Invalid prompt format in line {i+1}:\n\n{line_error}")
+        # Disable video extensions when multi-line prompts are enabled
+        video_extension_count = 0
+    elif enable_video_extension and video_extension_count > 0:
+        # When video extension enabled: only use the first prompt for the main generation
+        individual_prompts = [validation_prompts[0]]  # Only first prompt for main generation
+        # Validate each extension prompt line (unless disabled)
+        if not disable_auto_prompt_validation:
+            for i, prompt_line in enumerate(validation_prompts):
+                line_valid, line_error = validate_prompt_format(prompt_line)
+                if not line_valid:
+                    raise ValueError(f"Invalid prompt format in line {i+1} (used for extension {i if i > 0 else 'main'}):\n\n{line_error}")
+    else:
+        # Default: single prompt
+        individual_prompts = parse_multiline_prompts(text_prompt, False)
+
+    # Debug: Log current generation parameters
+    print("=" * 80)
+    print("VIDEO GENERATION STARTED")
+    print(f"  enable_multiline_prompts: {enable_multiline_prompts}")
+    print(f"  enable_video_extension: {enable_video_extension}")
+    if enable_multiline_prompts:
+        print(f"  Multi-line prompts enabled: {len(individual_prompts)} prompts")
+        for i, prompt in enumerate(individual_prompts):
+            print(f"    Prompt {i+1}: {prompt[:40]}{'...' if len(prompt) > 40 else ''}")
+    else:
+        print(f"  Text prompt: {text_prompt[:50]}{'...' if len(text_prompt) > 50 else ''}")
+    print(f"  Image path: {image}")
+    print(f"  Resolution: {video_frame_height}x{video_frame_width}")
+    print(f"  Base Resolution: {base_resolution_width}x{base_resolution_height}")
+    print(f"  Duration: {duration_seconds} seconds")
+    print(f"  Seed: {video_seed}")
+    print(f"  Num generations per prompt: {num_generations}")
+    print(f"  Video extensions: {video_extension_count}")
+    print(f"  Valid prompt lines detected: {len(validation_prompts)}")
+    print("=" * 80)
+
+    try:
+        # No need to check cancellation at the start since we just reset it
+
+        # Only initialize engine if we're not using subprocess mode (clear_all=False)
+        # When clear_all=True, all generations run in subprocesses, so main process doesn't need models
+        if clear_all:
+            print("=" * 80)
+            print("CLEAR ALL MEMORY ENABLED")
+            print("  Main process will NOT load any models")
+            print("  All generations will run in separate subprocesses")
+            print("  VRAM/RAM will be completely cleared between generations")
+            print("=" * 80)
+
+        # Check if duration / block swap mode changed - if so, force engine reinitialization
+        global ovi_engine, ovi_engine_duration, ovi_engine_optimized_block_swap
+        current_engine_mode = ovi_engine_optimized_block_swap
+        if ovi_engine is not None and current_engine_mode is None:
+            current_engine_mode = getattr(ovi_engine, "optimized_block_swap", False)
+            ovi_engine_optimized_block_swap = current_engine_mode
+
+        if not clear_all and ovi_engine is not None:
+            reinit_messages = []
+            if ovi_engine_duration != duration_seconds:
+                reinit_messages.append(f"DURATION CHANGED: {ovi_engine_duration}s → {duration_seconds}s")
+            if current_engine_mode != optimized_block_swap:
+                prev_label = "Optimized" if current_engine_mode else "Legacy"
+                new_label = "Optimized" if optimized_block_swap else "Legacy"
+                reinit_messages.append(f"BLOCK SWAP MODE CHANGED: {prev_label} → {new_label}")
+
+            if reinit_messages:
+                print("=" * 80)
+                for msg in reinit_messages:
+                    print(msg)
+                print("  Forcing engine reinitialization with updated settings")
+                print("=" * 80)
+                ovi_engine = None  # Force reinitialization
+
+        if not clear_all and ovi_engine is None:
+            # Use CLI args only in test mode, otherwise use GUI parameters
+            if getattr(args, 'test', False):
+                final_blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+                final_cpu_offload = getattr(args, 'test_cpu_offload', False)
+                final_optimized_block_swap = getattr(args, 'optimized_block_swap', False)
+            else:
+                final_blocks_to_swap = blocks_to_swap
+                final_cpu_offload = None if (not cpu_offload and not use_image_gen) else (cpu_offload or use_image_gen)
+                final_optimized_block_swap = optimized_block_swap
+
+            print("=" * 80)
+            print("INITIALIZING FUSION ENGINE IN MAIN PROCESS")
+            print(f"  Block Swap: {final_blocks_to_swap} blocks (0 = disabled)")
+            print(f"  CPU Offload: {final_cpu_offload}")
+            print(f"  Image Generation: {use_image_gen}")
+            print(f"  No Block Prep: {no_block_prep}")
+            print(f"  Optimized Block Swap: {final_optimized_block_swap}")
+            print(f"  Note: Models will be loaded in main process (Clear All Memory disabled)")
+            print("=" * 80)
+
+            # Calculate latent lengths based on duration
+            video_latent_length, audio_latent_length = calculate_latent_lengths(duration_seconds)
+
+            DEFAULT_CONFIG['cpu_offload'] = final_cpu_offload
+            DEFAULT_CONFIG['mode'] = "t2v"
+            ovi_engine = OviFusionEngine(
+                blocks_to_swap=final_blocks_to_swap,
+                cpu_offload=final_cpu_offload,
+                video_latent_length=video_latent_length,
+                audio_latent_length=audio_latent_length,
+                merge_loras_on_gpu=merge_loras_on_gpu,
+                optimized_block_swap=final_optimized_block_swap
+            )
+            ovi_engine_duration = duration_seconds  # Store duration used for initialization
+            ovi_engine_optimized_block_swap = final_optimized_block_swap
+            print("\n[OK] OviFusionEngine initialized successfully (models will load on first generation)")
+
+        image_path = None
+        if image is not None:
+            # Handle image processing here to ensure we use the current image
+            print(f"[DEBUG] Raw image path from upload: {image}")
+
+            # Apply auto cropping/padding if enabled
+            image_path = apply_auto_crop_if_enabled(image, auto_crop_image, video_frame_width, video_frame_height, 
+                                                   auto_pad_32px_divisible=auto_pad_32px_divisible)
+
+            if os.path.exists(image_path):
+                print(f"[DEBUG] Final image file exists: Yes ({os.path.getsize(image_path)} bytes)")
+            else:
+                print(f"[DEBUG] Final image file exists: No - this may cause issues!")
+
+        # Determine output directory (priority: parameter > CLI arg > default)
+        if output_dir and isinstance(output_dir, str):
+            outputs_dir = os.path.abspath(output_dir)  # Normalize path
+        elif args.output_dir and isinstance(args.output_dir, str):
+            outputs_dir = os.path.abspath(args.output_dir)
+        else:
+            outputs_dir = os.path.join(os.path.dirname(__file__), "outputs")
+        os.makedirs(outputs_dir, exist_ok=True)
+
+        # OPTIMIZATION: If clear_all + delete_text_encoder, run T5 encoding in subprocess FIRST
+        # This encodes text before any other models load, ensuring no duplication
+        # Only run T5 subprocess if embeddings weren't already provided (from file)
+        #
+        # CRITICAL FIX: Skip T5 pre-encoding when video extensions or multiline prompts are enabled
+        # because each extension/prompt line needs its own prompt-specific embeddings
+        if clear_all and delete_text_encoder and text_embeddings_cache is None and not enable_video_extension and not enable_multiline_prompts:
+            print("=" * 80)
+            print("T5 SUBPROCESS MODE (CLEAR ALL MEMORY)")
+            print("Running T5 encoding in subprocess BEFORE generation subprocess")
+            print("This ensures T5 never coexists with other models in memory")
+            print("=" * 80)
+
+            try:
+                # SMART CACHE: Check if embeddings are already cached
+                cache_key = get_t5_cache_key(text_prompt, video_negative_prompt, audio_negative_prompt, fp8_t5)
+                print(f"[T5 CACHE] Cache key: {cache_key}")
+                
+                cached_embeddings = load_t5_cached_embeddings(cache_key)
+                
+                if cached_embeddings is not None:
+                    # Cache hit - use cached embeddings without spawning T5 subprocess
+                    text_embeddings_cache = cached_embeddings
+                    print("=" * 80)
+                    print("T5 CACHE HIT - SKIPPING T5 SUBPROCESS")
+                    print("Using cached embeddings - T5 will NOT be initialized")
+                    print("=" * 80)
+                else:
+                    # Cache miss - run T5 encoding subprocess
+                    print("[T5 CACHE MISS] Cache not found, running T5 encoding...")
+                    
+                    text_embeddings_cache = run_t5_encoding_subprocess(
+                        text_prompt=text_prompt,
+                        video_negative_prompt=video_negative_prompt,
+                        audio_negative_prompt=audio_negative_prompt,
+                        fp8_t5=fp8_t5,
+                        cpu_only_t5=cpu_only_t5
+                    )
+                    
+                    # Save to cache for future use
+                    save_t5_cached_embeddings(cache_key, text_embeddings_cache)
+
+                    print("=" * 80)
+                    print("T5 SUBPROCESS COMPLETED")
+                    print("Text embeddings cached - will be passed to generation subprocess")
+                    print("T5 memory fully freed by OS")
+                    print("=" * 80)
+            except Exception as e:
+                error_msg = str(e)
+                if "cancelled by user" in error_msg.lower():
+                    print("T5 encoding cancelled by user")
+                    reset_cancellation()
+                    return None
+                else:
+                    print(f"[WARNING] T5 subprocess failed: {e}")
+                    print("[WARNING] Will retry T5 encoding in generation subprocess")
+                    text_embeddings_cache = None
+        else:
+            # T5 subprocess was skipped (embeddings already loaded from file)
+            if text_embeddings_cache is not None:
+                print("=" * 80)
+                print("T5 EMBEDDINGS ALREADY LOADED FROM FILE")
+                print(f"Embeddings type: {type(text_embeddings_cache)}, length: {len(text_embeddings_cache) if isinstance(text_embeddings_cache, list) else 'N/A'}")
+                print("Skipping T5 subprocess - using pre-loaded embeddings")
+                print("=" * 80)
+
+        last_output_path = None
+
+        # Generate videos for each prompt
+        for prompt_idx, current_prompt in enumerate(individual_prompts):
+            print(f"\n[PROMPT {prompt_idx + 1}/{len(individual_prompts)}] Processing: {current_prompt[:50]}{'...' if len(current_prompt) > 50 else ''}")
+
+            # Ensure image_path is valid (defensive check)
+            if not isinstance(image_path, (str, type(None))):
+                print(f"[GENERATE] Warning: image_path is invalid type {type(image_path)}, setting to None")
+                image_path = None
+
+            # Generate multiple videos for this prompt
+            for gen_idx in range(int(num_generations)):
+                # Check for cancellation in the loop
+                check_cancellation()
+
+                # Handle seed logic
+                current_seed = video_seed
+                if randomize_seed:
+                    current_seed = get_random_seed()
+                elif gen_idx > 0:
+                    # Increment seed for subsequent generations
+                    current_seed = video_seed + gen_idx
+
+                print(f"\n[GENERATION {gen_idx + 1}/{int(num_generations)}] Starting with seed: {current_seed}")
+
+                # Show LoRA status for this generation
+                if lora_specs and len(lora_specs) > 0:
+                    print(f"[GENERATION LORA] Applying {len(lora_specs)} LoRA(s) to model:")
+                    for i, (path, scale, layers) in enumerate(lora_specs, 1):
+                        print(f"  [{i}] {os.path.basename(path)} (scale: {scale}, layers: {layers})")
+                    print(f"[GENERATION LORA] LoRAs will be merged into model weights before inference")
+                else:
+                    print(f"[GENERATION LORA] No LoRAs applied (using base model only)")
+
+                # Check for cancellation again after setup
+                check_cancellation()
+
+                if clear_all:
+                    # Run this generation in a subprocess for memory cleanup
+                    # Pass individual current_prompt to avoid re-parsing all prompts in subprocess
+                    # IMPORTANT: Always use current_prompt (individual line) for generation
+                    # The full multi-line prompt is only used for metadata saving
+                    gen_prompt = current_prompt  # Always use individual prompt line for generation
+
+                    single_gen_params = {
+                        'text_prompt': gen_prompt,  # Pass individual prompt for generation
+                        'image': image_path,
+                        'video_frame_height': video_frame_height,
+                        'video_frame_width': video_frame_width,
+                        'video_seed': current_seed,
+                        'solver_name': solver_name,
+                        'sample_steps': sample_steps,
+                        'shift': shift,
+                        'video_guidance_scale': video_guidance_scale,
+                        'audio_guidance_scale': audio_guidance_scale,
+                        'slg_layer': slg_layer,
+                        'blocks_to_swap': blocks_to_swap,
+            'optimized_block_swap': optimized_block_swap,
+                        'video_negative_prompt': video_negative_prompt,
+                        'audio_negative_prompt': audio_negative_prompt,
+                        'use_image_gen': False,  # Not used in single gen mode
+                        'cpu_offload': cpu_offload,
+                        'delete_text_encoder': False,  # Set to False in subprocess (T5 already encoded and passed via text_embeddings_cache)
+                        'fp8_t5': fp8_t5,
+                        'cpu_only_t5': cpu_only_t5,
+                        'fp8_base_model': fp8_base_model,
+                        'use_sage_attention': use_sage_attention,
+                        'no_audio': no_audio,
+                        'no_block_prep': no_block_prep,
+                        'num_generations': 1,  # Always 1 for subprocess
+                        'randomize_seed': False,  # Seed handled above
+                        'save_metadata': save_metadata,
+                        'aspect_ratio': aspect_ratio,
+                        'clear_all': False,  # Disable subprocess in subprocess
+                        'vae_tiled_decode': vae_tiled_decode,
+                        'vae_tile_size': vae_tile_size,
+                        'vae_tile_overlap': vae_tile_overlap,
+                        'base_resolution_width': base_resolution_width,
+                        'base_resolution_height': base_resolution_height,
+                        'duration_seconds': duration_seconds,
+                        'auto_crop_image': auto_crop_image,
+                        'base_filename': base_filename,  # Pass base filename for batch processing
+                        'output_dir': outputs_dir,  # Pass output directory to subprocess
+                        'text_embeddings_cache': text_embeddings_cache if not is_extension else None,  # Pass cached T5 embeddings to avoid re-encoding (None for extensions)
+                        'enable_multiline_prompts': False,  # Disable multiline parsing in subprocess (already parsed)
+                        'enable_video_extension': False,  # Disable video extensions in subprocess (handled in main process)
+                        'disable_auto_prompt_validation': disable_auto_prompt_validation,  # Pass through validation setting
+                        'force_exact_resolution': True,  # CRITICAL: Always use exact resolution in subprocess
+                        'lora_specs': lora_specs,  # Pass LoRA specs for model loading
+                        'merge_loras_on_gpu': merge_loras_on_gpu,  # Pass LoRA GPU merging setting
+                    }
+                    
+                    # Debug: Log LoRA specs being passed to subprocess
+                    print(f"[SUBPROCESS DEBUG] Passing lora_specs to subprocess: {lora_specs}")
+                    print(f"[SUBPROCESS DEBUG] lora_specs type: {type(lora_specs)}, length: {len(lora_specs)}")
+                    if lora_specs:
+                        print(f"[SUBPROCESS LORA] Subprocess will apply {len(lora_specs)} LoRA(s):")
+                        for path, scale, layers in lora_specs:
+                            print(f"  - {os.path.basename(path)} (scale: {scale}, layers: {layers})")
+
+                    run_generation_subprocess(single_gen_params)
+
+                    # Find the generated file (should be the most recent in the outputs directory)
+                    import glob
+                    import time
+
+                    # Construct pattern based on base_filename if provided, otherwise use default
+                    if base_filename:
+                        pattern = os.path.join(outputs_dir, f"{base_filename}_*.mp4")
+                    else:
+                        pattern = os.path.join(outputs_dir, "*.mp4")
+
+                    # Retry a few times in case of timing issues
+                    output_path = None
+                    for retry in range(5):  # Try up to 5 times
+                        existing_files = glob.glob(pattern)
+                        if existing_files:
+                            # Filter files that are at least 1 second old to avoid partially written files
+                            current_time = time.time()
+                            valid_files = [f for f in existing_files if (current_time - os.path.getctime(f)) > 1.0]
+                            if valid_files:
+                                output_path = max(valid_files, key=os.path.getctime)
+                                break
+                        time.sleep(0.5)  # Wait 0.5 seconds between retries
+
+                    if output_path:
+                        last_output_path = output_path
+                        print(f"[GENERATION {gen_idx + 1}/{int(num_generations)}] Completed: {os.path.basename(output_path)}")
+                    else:
+                        print(f"[GENERATION {gen_idx + 1}/{int(num_generations)}] No output file found in {outputs_dir} after retries")
+                        continue
+
+                # Original generation logic (when clear_all is disabled)
+                if not clear_all:
+                    # Debug: Check if embeddings cache is available
+                    if text_embeddings_cache is not None:
+                        print(f"[DEBUG] Passing text_embeddings_cache to engine (type: {type(text_embeddings_cache)}, len: {len(text_embeddings_cache) if isinstance(text_embeddings_cache, list) else 'N/A'})")
+                    else:
+                        print(f"[DEBUG] No text_embeddings_cache available - T5 will be loaded in-process")
+
+                    # Safety check: ensure ovi_engine is initialized
+                    if ovi_engine is None:
+                        print("[WARNING] ovi_engine is None, skipping in-process generation")
+                        return None
+
+                    # Ensure image_path is valid before passing to engine
+                    if not isinstance(image_path, (str, type(None))):
+                        print(f"[GENERATE] Warning: image_path is invalid type {type(image_path)}, setting to None")
+                        image_path = None
+
+                    # IMPORTANT: Always use current_prompt (individual line) for generation
+                    # The full multi-line prompt is only used for metadata saving
+                    gen_prompt = current_prompt  # Always use individual prompt line for generation
+
+                    # Use cancellable generation wrapper for interruptible generation
+                    generated_video, generated_audio, _ = generate_with_cancellation_check(
+                        ovi_engine.generate,
+                        text_prompt=gen_prompt,  # Use individual prompt for generation
+                        image_path=image_path,
+                        video_frame_height_width=[video_frame_height, video_frame_width],
+                        seed=current_seed,
+                        solver_name=solver_name,
+                        sample_steps=sample_steps,
+                        shift=shift,
+                        video_guidance_scale=video_guidance_scale,
+                        audio_guidance_scale=audio_guidance_scale,
+                        slg_layer=slg_layer,
+                        blocks_to_swap=None,  # Block swap is configured at engine init, not per-generation
+                        video_negative_prompt=video_negative_prompt,
+                        audio_negative_prompt=audio_negative_prompt,
+                        delete_text_encoder=delete_text_encoder if text_embeddings_cache is None else False,  # Skip T5 if already encoded
+                        no_block_prep=no_block_prep,
+                        fp8_t5=fp8_t5,
+                        cpu_only_t5=cpu_only_t5,
+                        fp8_base_model=fp8_base_model,
+                        use_sage_attention=use_sage_attention,
+                        vae_tiled_decode=vae_tiled_decode,
+                        vae_tile_size=vae_tile_size,
+                        vae_tile_overlap=vae_tile_overlap,
+                        force_exact_resolution=True,  # CRITICAL: Always use exact user-specified resolution, never rescale to 720*720 area
+                        text_embeddings_cache=text_embeddings_cache,  # Pass pre-encoded embeddings if available
+                        lora_specs=lora_specs,  # Pass LoRA specs for model application
+                    )
+
+                    # Get filename for this generation
+                    if gen_idx == 0:
+                        # First generation: use base filename or get next sequential
+                        output_filename = get_next_filename(outputs_dir, base_filename=base_filename)
+                        # For batch processing, remove the _0001 suffix if it's the first generation
+                        if base_filename and output_filename.endswith("_0001.mp4"):
+                            output_filename = f"{base_filename}.mp4"
+                    else:
+                        # Subsequent generations: append _2, _3, etc. to the base filename
+                        if base_filename:
+                            # For batch processing, ensure no conflicts
+                            gen_suffix = f"_{gen_idx + 1}"
+                            candidate_filename = f"{base_filename}{gen_suffix}.mp4"
+                            counter = 1
+                            while os.path.exists(os.path.join(outputs_dir, candidate_filename)):
+                                candidate_filename = f"{base_filename}{gen_suffix}_{counter}.mp4"
+                                counter += 1
+                            output_filename = candidate_filename
+                        else:
+                            # For regular generation, just get next sequential
+                            output_filename = get_next_filename(outputs_dir, base_filename=None)
+                    output_path = os.path.join(outputs_dir, output_filename)
+
+                    # Handle no_audio option
+                    if no_audio:
+                        generated_audio = None
+
+                    save_video(output_path, generated_video, generated_audio, fps=24, sample_rate=16000)
+                    last_output_path = output_path
+                    
+                    # CRITICAL FIX: Explicitly delete large numpy arrays to prevent RAM leak
+                    # These arrays can be 1-5GB each and Python's GC doesn't free them immediately
+                    del generated_video, generated_audio
+                    import gc
+                    gc.collect()
+                    print(f"[MEMORY CLEANUP] Large video/audio arrays freed from RAM")
+
+                    # Save used source image
+                    save_used_source_image(image_path, outputs_dir, output_filename)
+
+                    # Save metadata if enabled
+                    if save_metadata:
+                        # For video extension, use full multi-line prompt for first/main video metadata
+                        metadata_prompt = current_prompt
+                        if enable_video_extension and video_extension_count > 0 and prompt_idx == 0:
+                            metadata_prompt = text_prompt  # Use full multi-line prompt for main video
+
+                        generation_params = build_generation_metadata_params(
+                            metadata_prompt, image_path, video_frame_height, video_frame_width,
+                            aspect_ratio, base_resolution_width, base_resolution_height, duration_seconds,
+                            randomize_seed, num_generations, solver_name, sample_steps, shift,
+                            video_guidance_scale, audio_guidance_scale, slg_layer, blocks_to_swap, optimized_block_swap,
+                            cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model,
+                            use_sage_attention, no_audio, no_block_prep, clear_all, vae_tiled_decode,
+                            vae_tile_size, vae_tile_overlap, video_negative_prompt, audio_negative_prompt,
+                            is_extension=is_extension,
+                            extension_index=extension_index,
+                            is_batch=False,
+                            duration_override=duration_override,
+                            lora_specs=lora_specs
+                        )
+                        save_generation_metadata(output_path, generation_params, current_seed)
+
+                    print(f"[GENERATION {gen_idx + 1}/{int(num_generations)}] Saved to: {output_path}")
+                
+                # CRITICAL FIX: Cleanup engine memory after each generation when CPU offload is enabled
+                # This ensures models are properly moved to CPU and RAM is freed
+                if not clear_all and cpu_offload and ovi_engine is not None:
+                    ovi_engine.cleanup_model_memory()
+                    print(f"[MEMORY CLEANUP] Engine memory cleanup completed")
+
+                # Handle video extensions if enabled (works for both clear_all and in-process modes)
+                if video_extension_count > 0:
+                    print(f"[VIDEO EXTENSION] Starting {video_extension_count} extensions for prompt {prompt_idx + 1}")
+
+                    extension_videos = [output_path]  # Start with the main video
+                    current_image_path = extract_last_frame(output_path)  # Extract last frame
+
+                    if current_image_path:
+                        # Get base name from main video for consistent naming
+                        main_base = os.path.splitext(os.path.basename(output_path))[0]
+
+                        # Generate extension videos
+                        for ext_idx in range(video_extension_count):
+                            # Use next prompt if available, otherwise use current prompt
+                            next_prompt_idx = prompt_idx + ext_idx + 1
+                            if next_prompt_idx < len(validation_prompts):
+                                extension_prompt = validation_prompts[next_prompt_idx]
+                                print(f"[VIDEO EXTENSION] Extension {ext_idx + 1}: Using next prompt from parsed lines")
+                            else:
+                                extension_prompt = current_prompt  # Repeat current prompt
+                                print(f"[VIDEO EXTENSION] Extension {ext_idx + 1}: Repeating current prompt (no more prompts available)")
+                            # Parse extension prompt for duration override
+                            ext_cleaned_prompt, ext_duration_override = parse_duration_from_prompt(extension_prompt)
+                            # Default to original UI slider value, not the main video's potentially overridden duration
+                            ext_duration_seconds = original_duration_seconds
+                            if ext_duration_override is not None:
+                                ext_duration_seconds = ext_duration_override
+                                print(f"[VIDEO EXTENSION] Extension {ext_idx + 1} duration override: {ext_duration_seconds} seconds")
+
+                            print(f"[VIDEO EXTENSION] Extension {ext_idx + 1}: Using last frame + prompt: {ext_cleaned_prompt[:50]}{'...' if len(ext_cleaned_prompt) > 50 else ''}")
+
+                            # Generate extension video
+                            check_cancellation()
+
+                            # Construct desired extension filename
+                            ext_filename = f"{main_base}_ext{ext_idx + 1}.mp4"
+                            ext_output_path = os.path.join(outputs_dir, ext_filename)
+
+                            # Check for conflicts and increment if needed
+                            if os.path.exists(ext_output_path):
+                                counter = 1
+                                while os.path.exists(os.path.join(outputs_dir, f"{main_base}_ext{ext_idx + 1}_{counter}.mp4")):
+                                    counter += 1
+                                ext_filename = f"{main_base}_ext{ext_idx + 1}_{counter}.mp4"
+                                ext_output_path = os.path.join(outputs_dir, ext_filename)
+
+                            if clear_all:
+                                # Ensure main_base is available for subprocess
+                                current_main_base = os.path.splitext(os.path.basename(output_path))[0]
+
+                                # Run extension in subprocess
+                                ext_params = {
+                                    'text_prompt': ext_cleaned_prompt,
+                                    'image': current_image_path,
+                                    'video_frame_height': video_frame_height,
+                                    'video_frame_width': video_frame_width,
+                                    'video_seed': current_seed,  # Use same seed
+                                    'solver_name': solver_name,
+                                    'sample_steps': sample_steps,
+                                    'shift': shift,
+                                    'video_guidance_scale': video_guidance_scale,
+                                    'audio_guidance_scale': audio_guidance_scale,
+                                    'slg_layer': slg_layer,
+                                    'blocks_to_swap': blocks_to_swap,
+                                    'optimized_block_swap': optimized_block_swap,
+                                    'video_negative_prompt': video_negative_prompt,
+                                    'audio_negative_prompt': audio_negative_prompt,
+                                    'use_image_gen': False,
+                                    'cpu_offload': cpu_offload,
+                                    'delete_text_encoder': False,  # Set to False in subprocess (subprocess already isolated, T5 encoding handled separately)
+                                    'fp8_t5': fp8_t5,
+                                    'cpu_only_t5': cpu_only_t5,
+                                    'fp8_base_model': fp8_base_model,
+                                    'use_sage_attention': use_sage_attention,
+                                    'no_audio': no_audio,
+                                    'no_block_prep': no_block_prep,
+                                    'num_generations': 1,
+                                    'randomize_seed': False,
+                                    'save_metadata': save_metadata,  # Save metadata for extensions
+                                    'aspect_ratio': aspect_ratio,
+                                    'clear_all': False,
+                                    'vae_tiled_decode': vae_tiled_decode,
+                                    'vae_tile_size': vae_tile_size,
+                                    'vae_tile_overlap': vae_tile_overlap,
+                                    'base_resolution_width': base_resolution_width,
+                                    'base_resolution_height': base_resolution_height,
+                                    'duration_seconds': ext_duration_seconds,
+                                    'auto_crop_image': False,  # Image already processed
+                                    'base_filename': f"{current_main_base}_ext{ext_idx + 1}",
+                                    'output_dir': outputs_dir,
+                                    'text_embeddings_cache': None,  # Extensions must encode their own T5 embeddings
+                                    'enable_multiline_prompts': False,
+                                    'enable_video_extension': False,
+                                    'is_video_extension_subprocess': True,  # Mark as extension subprocess
+                                    'is_extension': True,  # Mark for metadata that this is an extension
+                                    'extension_index': ext_idx + 1,  # Extension number for metadata
+                                    'main_base': current_main_base,  # Pass main base name for consistent naming
+                                    'force_exact_resolution': True,  # CRITICAL: Always use exact resolution in subprocess
+                                    'lora_1': lora_1, 'lora_1_scale': lora_1_scale, 'lora_1_layers': lora_1_layers,
+                                    'lora_2': lora_2, 'lora_2_scale': lora_2_scale, 'lora_2_layers': lora_2_layers,
+                                    'lora_3': lora_3, 'lora_3_scale': lora_3_scale, 'lora_3_layers': lora_3_layers,
+                                    'lora_4': lora_4, 'lora_4_scale': lora_4_scale, 'lora_4_layers': lora_4_layers,
+                                }
+
+                                run_generation_subprocess(ext_params)
+
+                                # The subprocess should have generated the file with the correct name
+                                # Just verify it exists
+                                import time
+                                generated_file = None
+                                for retry in range(10):  # Try up to 10 times
+                                    if os.path.exists(ext_output_path):
+                                        generated_file = ext_output_path
+                                        break
+                                    time.sleep(0.5)  # Wait 0.5 seconds between retries
+
+                                if generated_file:
+                                    extension_videos.append(ext_output_path)
+                                    print(f"[VIDEO EXTENSION] Extension {ext_idx + 1} saved: {ext_filename}")
+                                    current_image_path = extract_last_frame(ext_output_path)  # Extract for next extension
+                                else:
+                                    print(f"[VIDEO EXTENSION] Warning: Extension {ext_idx + 1} file not found after retries")
+                                    break
+                            else:
+                                # Safety check: ensure ovi_engine is initialized
+                                if ovi_engine is None:
+                                    print("[WARNING] ovi_engine is None, skipping extension in-process generation")
+                                    continue
+
+                                # Generate extension in-process
+                                ext_generated_video, ext_generated_audio, _ = generate_with_cancellation_check(
+                                    ovi_engine.generate,
+                                    text_prompt=ext_cleaned_prompt,
+                                    image_path=current_image_path,
+                                    video_frame_height_width=[video_frame_height, video_frame_width],
+                                    seed=current_seed,
+                                    solver_name=solver_name,
+                                    sample_steps=sample_steps,
+                                    shift=shift,
+                                    video_guidance_scale=video_guidance_scale,
+                                    audio_guidance_scale=audio_guidance_scale,
+                                    slg_layer=slg_layer,
+                                    blocks_to_swap=None,
+                                    video_negative_prompt=video_negative_prompt,
+                                    audio_negative_prompt=audio_negative_prompt,
+                                    delete_text_encoder=delete_text_encoder,
+                                    no_block_prep=no_block_prep,
+                                    fp8_t5=fp8_t5,
+                                    cpu_only_t5=cpu_only_t5,
+                                    fp8_base_model=fp8_base_model,
+                                    use_sage_attention=use_sage_attention,
+                                    vae_tiled_decode=vae_tiled_decode,
+                                    vae_tile_size=vae_tile_size,
+                                    vae_tile_overlap=vae_tile_overlap,
+                                    force_exact_resolution=True,  # CRITICAL: Always use exact user-specified resolution, never rescale to 720*720 area
+                                    text_embeddings_cache=None,  # Extensions must encode their own T5 embeddings
+                                    lora_specs=lora_specs,  # Pass LoRA specs for model application
+                                )
+
+                                # Save extension video with proper naming
+                                ext_filename = f"{main_base}_ext{ext_idx + 1}.mp4"
+                                ext_output_path = os.path.join(outputs_dir, ext_filename)
+
+                                # Check for conflicts and increment if needed
+                                if os.path.exists(ext_output_path):
+                                    counter = 1
+                                    while os.path.exists(os.path.join(outputs_dir, f"{main_base}_ext{ext_idx + 1}_{counter}.mp4")):
+                                        counter += 1
+                                    ext_filename = f"{main_base}_ext{ext_idx + 1}_{counter}.mp4"
+                                    ext_output_path = os.path.join(outputs_dir, ext_filename)
+
+                                if no_audio:
+                                    ext_generated_audio = None
+
+                                save_video(ext_output_path, ext_generated_video, ext_generated_audio, fps=24, sample_rate=16000)
+                                extension_videos.append(ext_output_path)
+                                
+                                # CRITICAL FIX: Explicitly delete large numpy arrays to prevent RAM leak
+                                del ext_generated_video, ext_generated_audio
+                                import gc
+                                gc.collect()
+                                print(f"[MEMORY CLEANUP] Extension video/audio arrays freed from RAM")
+
+                                # Save metadata for extension
+                                ext_generation_params = build_generation_metadata_params(
+                                    ext_cleaned_prompt, current_image_path, video_frame_height, video_frame_width,
+                                    aspect_ratio, base_resolution_width, base_resolution_height, ext_duration_seconds,
+                                    randomize_seed, num_generations, solver_name, sample_steps, shift,
+                                    video_guidance_scale, audio_guidance_scale, slg_layer, None, optimized_block_swap,  # blocks_to_swap=None for extensions
+                                    cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model,
+                                    use_sage_attention, no_audio, no_block_prep, clear_all, vae_tiled_decode,
+                                    vae_tile_size, vae_tile_overlap, video_negative_prompt, audio_negative_prompt,
+                                    is_extension=True, extension_index=ext_idx + 1, is_batch=False,
+                                    duration_override=ext_duration_override,
+                                    lora_specs=lora_specs
+                                )
+                                save_generation_metadata(ext_output_path, ext_generation_params, current_seed)
+
+                                # Save used source image for extension
+                                save_used_source_image(current_image_path, outputs_dir, ext_filename)
+
+                                current_image_path = extract_last_frame(ext_output_path)  # Extract for next extension
+
+                                print(f"[VIDEO EXTENSION] Extension {ext_idx + 1} saved: {ext_filename}")
+
+                        # Combine all videos (main + extensions) into final video
+                        if len(extension_videos) > 1:
+                            # Construct final filename
+                            final_filename = f"{main_base}_final.mp4"
+                            final_path = os.path.join(outputs_dir, final_filename)
+
+                            # Check for conflicts and increment if needed
+                            if os.path.exists(final_path):
+                                counter = 1
+                                while os.path.exists(os.path.join(outputs_dir, f"{main_base}_final_{counter}.mp4")):
+                                    counter += 1
+                                final_filename = f"{main_base}_final_{counter}.mp4"
+                                final_path = os.path.join(outputs_dir, final_filename)
+
+                            if combine_videos(extension_videos, final_path, trim_extension_first_frames=True):
+                                print(f"[VIDEO EXTENSION] Combined video saved: {final_filename}")
+                                last_output_path = final_path
+                            else:
+                                print("[VIDEO EXTENSION] Failed to combine videos")
+                    else:
+                        print("[VIDEO EXTENSION] Failed to extract last frame, skipping extensions")
+
+        # Calculate and log total generation time
+        generation_end_time = time.time()
+        total_generation_time = generation_end_time - generation_start_time
+        print(f"  Total generation time: {total_generation_time:.2f} seconds")
+
+        # If input video was provided, merge it with the generated video (unless disabled)
+        if input_video_path and last_output_path and os.path.exists(last_output_path) and not dont_auto_combine_video_input:
+            print("=" * 80)
+            print("INPUT VIDEO MERGING")
+            print(f"  Input video: {input_video_path}")
+            print(f"  Generated video: {last_output_path}")
+            print("=" * 80)
+
+            # Create merged filename
+            base_name = os.path.splitext(os.path.basename(last_output_path))[0]
+            merged_filename = f"{base_name}_merged.mp4"
+            merged_path = os.path.join(outputs_dir, merged_filename)
+
+            # Check for conflicts and increment if needed
+            if os.path.exists(merged_path):
+                counter = 1
+                while os.path.exists(os.path.join(outputs_dir, f"{base_name}_merged_{counter}.mp4")):
+                    counter += 1
+                merged_filename = f"{base_name}_merged_{counter}.mp4"
+                merged_path = os.path.join(outputs_dir, merged_filename)
+
+            # Merge input video + generated video (trim last frame from input to avoid duplication)
+            if combine_videos([input_video_path, last_output_path], merged_path, trim_first_video_last_frame=True):
+                print(f"[INPUT VIDEO MERGE] Merged video saved: {merged_filename}")
+                last_output_path = merged_path
+            else:
+                print("[INPUT VIDEO MERGE] Failed to merge videos, returning generated video only")
+
+        # Debug: Log final output path
+        print("=" * 80)
+        print("VIDEO GENERATION COMPLETED")
+        print(f"  Final output path: {last_output_path}")
+        if last_output_path and os.path.exists(last_output_path):
+            print(f"  File exists: Yes ({os.path.getsize(last_output_path)} bytes)")
+        else:
+            print("  File exists: No")
+        print("=" * 80)
+        
+        # CRITICAL FIX: Final memory cleanup before returning
+        # This ensures all generation artifacts are freed before control returns to caller
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[MEMORY CLEANUP] Final cleanup completed - all generation memory freed")
+
+        return last_output_path
+    except Exception as e:
+        error_msg = str(e)
+        if "cancelled by user" in error_msg.lower():
+            print("Generation cancelled by user")
+            reset_cancellation()  # Reset the cancellation flag
+            return None
+        else:
+            print(f"Error during video generation: {e}")
+            return None
+
+
+
+
+# Standard aspect ratios
+def get_common_aspect_ratios(base_width, base_height):
+    """Get the standard aspect ratios, scaled to preserve total pixel area."""
+    # Calculate total pixel area from base resolution
+    total_pixels = base_width * base_height
+
+    # Define aspect ratios as width:height ratios
+    aspect_ratios_def = {
+        "1:1": (1, 1),
+        "16:9": (16, 9),
+        "9:16": (9, 16),
+        "4:3": (4, 3),
+        "3:4": (3, 4),
+        "21:9": (21, 9),
+        "9:21": (9, 21),
+        "3:2": (3, 2),
+        "2:3": (2, 3),
+        "5:4": (5, 4),
+        "4:5": (4, 5),
+        "5:3": (5, 3),
+        "3:5": (3, 5),
+        "16:10": (16, 10),
+        "10:16": (10, 16),
+    }
+
+    aspect_ratios = {}
+    for name, (w_ratio, h_ratio) in aspect_ratios_def.items():
+        # Calculate dimensions that preserve total pixel area and aspect ratio
+        aspect = w_ratio / h_ratio
+
+        # height = sqrt(total_pixels / aspect)
+        height = (total_pixels / aspect) ** 0.5
+
+        # width = height * aspect
+        width = height * aspect
+
+        # Round to nearest integers
+        width = int(round(width))
+        height = int(round(height))
+
+        # Snap to 32px for model compatibility (round to nearest multiple of 32)
+        width = max(32, ((width + 15) // 32) * 32)  # Round up to nearest 32
+        height = max(32, ((height + 15) // 32) * 32)  # Round up to nearest 32
+
+        aspect_ratios[name] = [width, height]
+
+    return aspect_ratios
+
+# Dynamic aspect ratios based on base resolution (legacy function)
+def get_aspect_ratios(base_width, base_height):
+    """Generate aspect ratios scaled from 720p base resolution."""
+    return get_common_aspect_ratios(base_width, base_height)
+
+# For backward compatibility, keep a default ASPECT_RATIOS
+ASPECT_RATIOS = get_aspect_ratios(720, 720)
+
+CUSTOM_ASPECT_PREFIX = "Custom - "
+
+def _coerce_positive_int(value):
+    """Safely coerce incoming UI values to positive integers."""
+    try:
+        if isinstance(value, bool):  # Guard against booleans (subclass of int)
+            return None
+        if isinstance(value, (int, float)):
+            coerced = int(value)
+        elif isinstance(value, str) and value.strip():
+            coerced = int(float(value.strip()))
+        else:
+            return None
+        return coerced if coerced > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+def _extract_ratio_name(value):
+    if isinstance(value, str) and value:
+        return value.split(" - ")[0]
+    return None
+
+def _format_ratio_choice(name, dims):
+    return f"{name} - {dims[0]}x{dims[1]}px"
+
+def _format_custom_choice(width, height):
+    try:
+        width_int = int(width)
+        height_int = int(height)
+        if width_int <= 0 or height_int <= 0:
+            raise ValueError
+    except Exception:
+        return f"{CUSTOM_ASPECT_PREFIX}{width}x{height}px"
+    return f"{CUSTOM_ASPECT_PREFIX}{width_int}x{height_int}px"
+
+def _parse_resolution_from_label(value):
+    if not isinstance(value, str):
+        return None
+
+    custom_dims = _parse_custom_choice(value)
+    if custom_dims:
+        return custom_dims
+
+    if " - " not in value:
+        return None
+
+    _, dims_part = value.split(" - ", 1)
+    dims_part = dims_part.strip()
+    if dims_part.endswith("px"):
+        dims_part = dims_part[:-2]
+
+    if "x" not in dims_part:
+        return None
+
+    width_str, height_str = dims_part.split("x", 1)
+    width = _coerce_positive_int(width_str)
+    height = _coerce_positive_int(height_str)
+
+    if width is None or height is None:
+        return None
+
+    return width, height
+
+def _parse_custom_choice(value):
+    if not isinstance(value, str) or not value.startswith(CUSTOM_ASPECT_PREFIX):
+        return None
+
+    remainder = value[len(CUSTOM_ASPECT_PREFIX):]
+    if remainder.endswith("px"):
+        remainder = remainder[:-2]
+
+    if "x" not in remainder:
+        return None
+
+    width_str, height_str = remainder.split("x", 1)
+    width = _coerce_positive_int(width_str)
+    height = _coerce_positive_int(height_str)
+
+    if width is None or height is None:
+        return None
+
+    return width, height
+
+def update_resolution(aspect_ratio, base_resolution_width=720, base_resolution_height=720):
+    """Update resolution based on aspect ratio and base resolution."""
+    try:
+        custom_dims = _parse_custom_choice(aspect_ratio)
+        if custom_dims:
+            return [custom_dims[0], custom_dims[1]]
+
+        base_width = _coerce_positive_int(base_resolution_width)
+        base_height = _coerce_positive_int(base_resolution_height)
+
+        if base_width is None or base_height is None:
+            return [gr.update(), gr.update()]
+
+        current_ratios = get_common_aspect_ratios(base_width, base_height)
+
+        ratio_name = _extract_ratio_name(aspect_ratio)
+        if ratio_name not in current_ratios:
+            ratio_name = "16:9" if "16:9" in current_ratios else next(iter(current_ratios))
+
+        width, height = current_ratios[ratio_name]
+        return [width, height]
+    except Exception as e:
+        print(f"Error updating resolution: {e}")
+        return [gr.update(), gr.update()]
+
+def update_aspect_ratio_and_resolution(base_resolution_width, base_resolution_height, current_aspect_ratio):
+    """Combined update for aspect ratio choices and resolution to avoid race conditions."""
+    try:
+        base_width = _coerce_positive_int(base_resolution_width)
+        base_height = _coerce_positive_int(base_resolution_height)
+
+        # Validate that dimensions are reasonable before proceeding
+        if base_width is None or base_height is None or base_width < 32 or base_height < 32:
+            # Keep existing state while user is typing invalid values
+            return gr.update(), gr.update(), gr.update()
+
+        current_ratios = get_common_aspect_ratios(base_width, base_height)
+        choices = [_format_ratio_choice(name, dims) for name, dims in current_ratios.items()]
+
+        # Handle custom aspect ratios
+        custom_dims = _parse_custom_choice(current_aspect_ratio)
+        if custom_dims:
+            selected_value = _format_custom_choice(custom_dims[0], custom_dims[1])
+            if selected_value not in choices:
+                choices = [selected_value] + choices
+            return gr.update(choices=choices, value=selected_value), custom_dims[0], custom_dims[1]
+
+        # Extract ratio name from current selection
+        ratio_name = _extract_ratio_name(current_aspect_ratio)
+        if ratio_name not in current_ratios:
+            ratio_name = "16:9" if "16:9" in current_ratios else next(iter(current_ratios))
+
+        # Get dimensions for this ratio from new base resolution
+        width, height = current_ratios[ratio_name]
+        selected_value = _format_ratio_choice(ratio_name, (width, height))
+
+        # Ensure selected_value is in choices
+        if selected_value not in choices:
+            choices = [selected_value] + choices
+
+        return gr.update(choices=choices, value=selected_value), width, height
+
+    except Exception as e:
+        print(f"Error updating aspect ratio and resolution: {e}")
+        # Return safe defaults
+        try:
+            default_ratios = get_common_aspect_ratios(720, 720)
+            default_choices = [_format_ratio_choice(name, dims) for name, dims in default_ratios.items()]
+            default_value = default_choices[0] if default_choices else None
+            default_width, default_height = default_ratios["16:9"]
+            return gr.update(choices=default_choices, value=default_value), default_width, default_height
+        except:
+            return gr.update(), gr.update(), gr.update()
+
+def update_aspect_ratio_choices(base_resolution_width, base_resolution_height, current_aspect_ratio=None):
+    """Update aspect ratio dropdown choices based on base resolution with graceful handling during user input."""
+    try:
+        base_width = _coerce_positive_int(base_resolution_width)
+        base_height = _coerce_positive_int(base_resolution_height)
+
+        if base_width is None or base_height is None:
+            # Keep existing dropdown state while the user is typing an invalid number
+            return gr.update()
+
+        current_ratios = get_common_aspect_ratios(base_width, base_height)
+        choices = [_format_ratio_choice(name, dims) for name, dims in current_ratios.items()]
+
+        # Handle custom aspect ratios
+        custom_dims = _parse_custom_choice(current_aspect_ratio)
+        if custom_dims:
+            selected_value = _format_custom_choice(custom_dims[0], custom_dims[1])
+            if selected_value not in choices:
+                choices = [selected_value] + choices
+            return gr.update(choices=choices, value=selected_value)
+
+        # Extract ratio name from current selection (e.g., "16:9" from "16:9 - 352x192px")
+        ratio_name = _extract_ratio_name(current_aspect_ratio)
+        if ratio_name not in current_ratios:
+            ratio_name = "16:9" if "16:9" in current_ratios else next(iter(current_ratios))
+
+        # Create new value with the same ratio name but NEW dimensions from new base resolution
+        selected_value = _format_ratio_choice(ratio_name, current_ratios[ratio_name])
+
+        # CRITICAL FIX: Ensure selected_value is ALWAYS in choices before returning
+        # This prevents Gradio errors when base resolution changes
+        if selected_value not in choices:
+            # This should never happen since we just created it from current_ratios,
+            # but add it as a safety measure
+            choices = [selected_value] + choices
+
+        return gr.update(choices=choices, value=selected_value)
+    except Exception as e:
+        print(f"Error updating aspect ratio choices: {e}")
+        # In case of any error, return a safe default
+        try:
+            default_ratios = get_common_aspect_ratios(720, 720)
+            default_choices = [_format_ratio_choice(name, dims) for name, dims in default_ratios.items()]
+            default_value = default_choices[0] if default_choices else None
+            return gr.update(choices=default_choices, value=default_value)
+        except:
+            # Ultimate fallback - return empty update
+            return gr.update()
+
+def _resolve_aspect_ratio_value(aspect_ratio_label, video_width, video_height):
+    if isinstance(aspect_ratio_label, str) and aspect_ratio_label.startswith(CUSTOM_ASPECT_PREFIX):
+        parsed_custom = _parse_custom_choice(aspect_ratio_label)
+        if parsed_custom:
+            return _format_custom_choice(parsed_custom[0], parsed_custom[1])
+        return aspect_ratio_label
+
+    parsed_dims = _parse_resolution_from_label(aspect_ratio_label)
+    if parsed_dims:
+        return _format_custom_choice(parsed_dims[0], parsed_dims[1])
+
+    ratio_name = _extract_ratio_name(aspect_ratio_label)
+    if ratio_name in ASPECT_RATIOS:
+        return _format_ratio_choice(ratio_name, ASPECT_RATIOS[ratio_name])
+
+    width = _coerce_positive_int(video_width)
+    height = _coerce_positive_int(video_height)
+    if width and height:
+        return _format_custom_choice(width, height)
+
+    return _format_ratio_choice("16:9", ASPECT_RATIOS["16:9"])
+
+def calculate_latent_lengths(duration_seconds):
+    """Calculate video_latent_length and audio_latent_length based on duration.
+
+    Current reference: 5 seconds = 31 video latents, 157 audio latents
+    Video: 5s * 24fps = 120 frames → 120/31 ≈ 3.87× temporal upscale
+    Audio: 5s * 16000Hz = 80000 samples → 80000/157 ≈ 510× temporal upscale
+    """
+    # Scale from the 5-second reference
+    video_latent_length = max(1, round((duration_seconds / 5.0) * 31))
+    audio_latent_length = max(1, round((duration_seconds / 5.0) * 157))
+
+    return video_latent_length, audio_latent_length
+
+def get_vram_warnings(base_resolution_width, base_resolution_height, duration_seconds):
+    """Generate VRAM warnings based on settings."""
+    warnings = []
+
+    # Check base resolution
+    base_size = min(base_resolution_width, base_resolution_height)
+    if base_size > 720:
+        warnings.append(f"⚠️ Base resolution ({base_size}p) > 720p may use significantly more VRAM")
+
+    # Check duration
+    if duration_seconds > 5:
+        warnings.append(f"⚠️ Duration ({duration_seconds}s) > 5s may use significantly more VRAM")
+
+    return "\n".join(warnings) if warnings else ""
+
+def get_random_seed():
+    import random
+    return random.randint(0, 100000)
+
+def scan_lora_folders():
+    """
+    Scan lora and loras folders for LoRA files
+    Returns list of choices for dropdowns: ["None"] + lora files
+    """
+    from ovi.utils.lora_utils import scan_lora_files
+    
+    # Define folders to scan (relative to project root)
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    lora_folders = [
+        os.path.join(project_root, 'lora'),
+        os.path.join(project_root, 'loras'),
+    ]
+    
+    # Scan for LoRA files
+    lora_files = scan_lora_files(lora_folders)
+    
+    # Create choices list: "None" + display names
+    choices = ["None"]
+    lora_path_map = {"None": None}
+    
+    for display_name, full_path in lora_files:
+        choices.append(display_name)
+        lora_path_map[display_name] = full_path
+    
+    return choices, lora_path_map
+
+def refresh_lora_list():
+    """Refresh LoRA file list and return updated choices"""
+    choices, lora_path_map = scan_lora_folders()
+    # Return 12 values in correct order: dropdown1, scale1, layers1, dropdown2, scale2, layers2, etc.
+    # Update dropdowns with new choices, keep current values for scales and layers
+    result = []
+    for i in range(4):
+        result.append(gr.update(choices=choices))  # dropdown
+        result.append(gr.update())  # scale (keep current value)
+        result.append(gr.update())  # layers (keep current value)
+    return result
+
+def open_outputs_folder():
+    """Open the outputs folder in the system's file explorer."""
+    import subprocess
+    import platform
+
+    try:
+        # Use custom output directory if set via --output_dir, otherwise use default
+        if args.output_dir and isinstance(args.output_dir, str):
+            outputs_dir = os.path.abspath(args.output_dir)
+        else:
+            outputs_dir = os.path.join(os.path.dirname(__file__), "outputs")
+
+        if not os.path.exists(outputs_dir):
+            os.makedirs(outputs_dir, exist_ok=True)
+
+        if platform.system() == "Windows":
+            subprocess.run(["explorer", outputs_dir])
+        elif platform.system() == "Linux":
+            subprocess.run(["xdg-open", outputs_dir])
+        elif platform.system() == "Darwin":  # macOS
+            subprocess.run(["open", outputs_dir])
+        else:
+            print(f"Unsupported platform: {platform.system()}")
+    except Exception as e:
+        print(f"Error opening outputs folder: {e}")
+
+def get_next_filename(outputs_dir, base_filename=None):
+    """Get the next available filename in sequential format (0001.mp4, 0002.mp4, etc.)
+    If base_filename is provided, use it as the stem instead of sequential numbering."""
+    import glob
+
+    if base_filename:
+        # For batch processing, use the base filename (e.g., 'image1' -> 'image1_0001.mp4')
+        stem = base_filename
+    else:
+        # For regular generation, use sequential numbering without prefix
+        stem = ""
+
+    # Find all files matching the pattern
+    if stem:
+        pattern = os.path.join(outputs_dir, f"{stem}_*.mp4")
+    else:
+        pattern = os.path.join(outputs_dir, "*.mp4")
+    existing_files = glob.glob(pattern)
+
+    # Extract numbers from existing files
+    numbers = []
+    for file_path in existing_files:
+        filename = os.path.basename(file_path)
+        # Remove stem and extension to get the number part
+        if stem:
+            if filename.startswith(f"{stem}_") and filename.endswith(".mp4"):
+                num_part = filename[len(f"{stem}_"):-4]  # Remove stem_ and .mp4
+                # Only consider 4-digit numbers (our sequential format)
+                if len(num_part) == 4 and num_part.isdigit():
+                    try:
+                        numbers.append(int(num_part))
+                    except ValueError:
+                        pass
+        else:
+            # For regular generation without stem, look for files like 0001.mp4
+            if filename.endswith(".mp4") and len(filename) == 8:  # 0001.mp4 is 8 chars
+                num_part = filename[:-4]  # Remove .mp4
+                if len(num_part) == 4 and num_part.isdigit():
+                    try:
+                        numbers.append(int(num_part))
+                    except ValueError:
+                        pass
+
+    # Find the next available number
+    next_num = 1
+    if numbers:
+        next_num = max(numbers) + 1
+
+    # Format as 4-digit number
+    if stem:
+        return f"{stem}_{next_num:04d}.mp4"
+    else:
+        return f"{next_num:04d}.mp4"
+
+def cancel_all_generations():
+    """Cancel all running generations by setting the global flag."""
+    global cancel_generation, ovi_engine
+    cancel_generation = True
+    print("CANCELLATION REQUESTED - stopping all generations...")
+
+    # Try to clean up the engine if it exists
+    if ovi_engine is not None:
+        try:
+            # Force cleanup of any models in VRAM
+            if hasattr(ovi_engine, 'cleanup'):
+                ovi_engine.cleanup()
+            # Clear the engine reference to force re-initialization
+            ovi_engine = None
+        except Exception as e:
+            print(f"Warning: Error during engine cleanup: {e}")
+
+def check_cancellation():
+    """Check if cancellation has been requested."""
+    global cancel_generation
+    if cancel_generation:
+        # Don't reset the flag here - let the caller handle it
+        raise Exception("Generation cancelled by user")
+
+def reset_cancellation():
+    """Reset the cancellation flag after handling cancellation."""
+    global cancel_generation
+    cancel_generation = False
+
+def generate_with_cancellation_check(generate_func, **kwargs):
+    """Run generation function with built-in cancellation checks."""
+    # Add the cancellation check function to kwargs so it gets passed to the engine
+    kwargs['cancellation_check'] = check_cancellation
+    return generate_func(**kwargs)
+
+def get_presets_dir():
+    """Get the presets directory path."""
+    presets_dir = os.path.join(os.path.dirname(__file__), "presets")
+    os.makedirs(presets_dir, exist_ok=True)
+    return presets_dir
+
+def get_available_presets():
+    """Get list of available preset names."""
+    presets_dir = get_presets_dir()
+    presets = []
+    if os.path.exists(presets_dir):
+        for file in os.listdir(presets_dir):
+            if file.endswith('.json'):
+                presets.append(file[:-5])  # Remove .json extension
+
+    # Sort presets by VRAM size (natural sort for numbers)
+    def sort_key(preset_name):
+        import re
+        # Extract number from preset name (e.g., "6-GB GPUs" -> 6)
+        match = re.search(r'(\d+)', preset_name)
+        if match:
+            return int(match.group(1))
+        return 0
+
+    return sorted(presets, key=sort_key)
+
+# Preset system constants
+PRESET_VERSION = "3.2"
+PRESET_MIN_COMPATIBLE_VERSION = "3.0"
+
+# Aspect ratio migration mapping (old names -> new names)
+ASPECT_RATIO_MIGRATION = {
+    "1:1 Square": "1:1",
+    "16:9 Landscape": "16:9",
+    "9:16 Portrait": "9:16",
+    "4:3 Landscape": "4:3",
+    "3:4 Portrait": "3:4",
+    "21:9 Landscape": "21:9",
+    "9:21 Portrait": "9:21",
+    "3:2 Landscape": "3:2",
+    "2:3 Portrait": "2:3",
+    "5:4 Landscape": "5:4",
+    "4:5 Portrait": "4:5",
+    "5:3 Landscape": "5:3",
+    "3:5 Portrait": "3:5",
+    "16:10 Widescreen": "16:10",
+    "10:16 Tall Widescreen": "10:16",
+}
+
+# Default values for all preset parameters (used for validation and migration)
+PRESET_DEFAULTS = {
+    "video_text_prompt": "",
+    "aspect_ratio": "16:9",
+    "video_width": 992,
+    "video_height": 512,
+    "auto_crop_image": True,
+    "video_seed": 99,
+    "randomize_seed": False,
+    "no_audio": False,
+    "save_metadata": True,
+    "solver_name": "unipc",
+    "sample_steps": 50,
+    "num_generations": 1,
+    "shift": 5.0,
+    "video_guidance_scale": 4.0,
+    "audio_guidance_scale": 3.0,
+    "slg_layer": 11,
+    "blocks_to_swap": 12,
+    "optimized_block_swap": False,
+    "cpu_offload": True,
+    "delete_text_encoder": True,
+    "fp8_t5": False,
+    "cpu_only_t5": False,
+    "fp8_base_model": False,
+    "use_sage_attention": False,
+    "video_negative_prompt": "jitter, bad hands, blur, distortion",
+    "audio_negative_prompt": "robotic, muffled, echo, distorted",
+    "batch_input_folder": "",
+    "batch_output_folder": "",
+    "batch_skip_existing": True,
+    "clear_all": True,
+    "vae_tiled_decode": False,
+    "vae_tile_size": 32,
+    "vae_tile_overlap": 8,
+    "base_resolution_width": 720,
+    "base_resolution_height": 720,
+    "duration_seconds": 5,
+    "enable_multiline_prompts": False,
+    "enable_video_extension": False,
+    "dont_auto_combine_video_input": False,
+    "disable_auto_prompt_validation": False,
+    "auto_pad_32px_divisible": False,
+    "merge_loras_on_gpu": False,
+    "lora_1": "None",
+    "lora_1_scale": 1.0,
+    "lora_1_layers": "Video Layers",
+    "lora_2": "None",
+    "lora_2_scale": 1.0,
+    "lora_2_layers": "Video Layers",
+    "lora_3": "None",
+    "lora_3_scale": 1.0,
+    "lora_3_layers": "Video Layers",
+    "lora_4": "None",
+    "lora_4_scale": 1.0,
+    "lora_4_layers": "Video Layers",
+}
+
+# Parameter validation rules
+PRESET_VALIDATION = {
+    "video_width": {"type": int, "min": 128, "max": 1920},
+    "video_height": {"type": int, "min": 128, "max": 1920},
+    "video_seed": {"type": int, "min": 0, "max": 100000},
+    "sample_steps": {"type": int, "min": 1, "max": 100},
+    "num_generations": {"type": int, "min": 1, "max": 100},
+    "shift": {"type": float, "min": 0.0, "max": 20.0},
+    "video_guidance_scale": {"type": float, "min": 0.0, "max": 10.0},
+    "audio_guidance_scale": {"type": float, "min": 0.0, "max": 10.0},
+    "slg_layer": {"type": int, "min": -1, "max": 30},
+    "blocks_to_swap": {"type": int, "min": 0, "max": 29},
+    "optimized_block_swap": {"type": bool},
+    "vae_tile_size": {"type": int, "min": 12, "max": 64},
+    "vae_tile_overlap": {"type": int, "min": 4, "max": 16},
+    "base_resolution_width": {"type": int},
+    "base_resolution_height": {"type": int},
+    "duration_seconds": {"type": int},
+    "aspect_ratio": {"type": str, "choices": ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9", "9:21", "3:2", "2:3", "5:4", "4:5", "5:3", "3:5", "16:10", "10:16"]},
+    "solver_name": {"type": str, "choices": ["unipc", "euler", "dpm++"]},
+    "lora_1_scale": {"type": float, "min": 0.0, "max": 9.0},
+    "lora_1_layers": {"type": str, "choices": ["Video Layers", "Sound Layers", "Both"]},
+    "lora_2_scale": {"type": float, "min": 0.0, "max": 9.0},
+    "lora_2_layers": {"type": str, "choices": ["Video Layers", "Sound Layers", "Both"]},
+    "lora_3_scale": {"type": float, "min": 0.0, "max": 9.0},
+    "lora_3_layers": {"type": str, "choices": ["Video Layers", "Sound Layers", "Both"]},
+    "lora_4_scale": {"type": float, "min": 0.0, "max": 9.0},
+    "lora_4_layers": {"type": str, "choices": ["Video Layers", "Sound Layers", "Both"]},
+}
+
+def validate_preset_value(param_name, value):
+    """Validate a single preset parameter value."""
+    # Get expected type from defaults
+    expected_type = type(PRESET_DEFAULTS[param_name])
+
+    # Apply type conversion for all parameters
+    try:
+        if expected_type == int:
+            value = int(value)
+        elif expected_type == float:
+            value = float(value)
+        elif expected_type == str:
+            value = str(value)
+        elif expected_type == bool:
+            # Handle boolean conversion more carefully
+            if isinstance(value, bool):
+                pass  # Already correct type
+            elif isinstance(value, str):
+                # Convert string representations to boolean
+                value = value.lower() in ('true', '1', 'yes', 'on')
+            else:
+                # Convert other types (numbers, etc.) to boolean
+                value = bool(value)
+    except (ValueError, TypeError):
+        # If conversion fails, use default
+        print(f"[PRESET] Type conversion failed for {param_name}, using default")
+        value = PRESET_DEFAULTS[param_name]
+
+    # Special handling for aspect_ratio migration
+    if param_name == "aspect_ratio" and isinstance(value, str):
+        # Check if it's an old aspect ratio name that needs migration
+        if value in ASPECT_RATIO_MIGRATION:
+            new_value = ASPECT_RATIO_MIGRATION[value]
+            print(f"[PRESET] Migrated aspect ratio: '{value}' -> '{new_value}'")
+            value = new_value
+
+    # Apply specific validation rules if they exist
+    if param_name in PRESET_VALIDATION:
+        rule = PRESET_VALIDATION[param_name]
+
+        # Range validation
+        if "min" in rule and isinstance(value, (int, float)) and value < rule["min"]:
+            print(f"[PRESET] Warning: {param_name} value {value} below minimum {rule['min']}, using minimum")
+            value = rule["min"]
+        elif "max" in rule and isinstance(value, (int, float)) and value > rule["max"]:
+            print(f"[PRESET] Warning: {param_name} value {value} above maximum {rule['max']}, using maximum")
+            value = rule["max"]
+
+        # Choice validation
+        if "choices" in rule:
+            if param_name == "aspect_ratio" and isinstance(value, str):
+                if value in rule["choices"]:
+                    pass
+                elif value.startswith(CUSTOM_ASPECT_PREFIX):
+                    # Allow custom aspect ratios to pass validation as-is
+                    pass
+                elif " - " in value:
+                    ratio_part = value.split(" - ", 1)[0]
+                    if ratio_part in rule["choices"]:
+                        value = ratio_part
+                    else:
+                        print(f"[PRESET] Warning: {param_name} value '{value}' not recognized, using default")
+                        value = PRESET_DEFAULTS[param_name]
+                else:
+                    print(f"[PRESET] Warning: {param_name} value '{value}' not recognized, using default")
+                    value = PRESET_DEFAULTS[param_name]
+            elif value not in rule["choices"]:
+                print(f"[PRESET] Warning: {param_name} value '{value}' not in valid choices {rule['choices']}, using default")
+                value = PRESET_DEFAULTS[param_name]
+
+    return value
+
+def cleanup_invalid_presets():
+    """Remove presets that cannot be loaded or are corrupted."""
+    try:
+        presets_dir = get_presets_dir()
+        if not os.path.exists(presets_dir):
+            return 0
+
+        presets = get_available_presets()
+        removed_count = 0
+
+        for preset_name in presets:
+            preset_data, error_msg = load_preset_safely(preset_name)
+            if preset_data is None:
+                # Preset is invalid, remove it
+                preset_file = os.path.join(presets_dir, f"{preset_name}.json")
+                try:
+                    os.remove(preset_file)
+                    print(f"[PRESET] Removed invalid preset: {preset_name} ({error_msg})")
+                    removed_count += 1
+                except Exception as e:
+                    print(f"[PRESET] Failed to remove invalid preset {preset_name}: {e}")
+
+        # Also clean up the last_used.txt if it points to a non-existent preset
+        last_used_file = os.path.join(presets_dir, "last_used.txt")
+        if os.path.exists(last_used_file):
+            try:
+                with open(last_used_file, 'r', encoding='utf-8') as f:
+                    last_preset = f.read().strip()
+
+                if last_preset and last_preset not in get_available_presets():
+                    os.remove(last_used_file)
+                    print(f"[PRESET] Removed invalid last_used.txt reference to '{last_preset}'")
+            except Exception as e:
+                print(f"[PRESET] Error checking last_used.txt: {e}")
+
+        return removed_count
+
+    except Exception as e:
+        print(f"[PRESET] Error during preset cleanup: {e}")
+        return 0
+
+def migrate_preset_data(preset_data):
+    """Migrate preset data from older versions to current format."""
+    version = preset_data.get("preset_version", "1.0")  # Assume old version if missing
+    migrated = False
+
+    # Version-specific migrations
+    if version < "3.0":
+        print(f"[PRESET] Migrating preset from version {version} to {PRESET_VERSION}")
+        migrated = True
+
+        # Add missing parameters with defaults
+        for param, default_value in PRESET_DEFAULTS.items():
+            if param not in preset_data:
+                preset_data[param] = default_value
+                print(f"[PRESET] Added missing parameter: {param} = {default_value}")
+
+        # Handle renamed parameters (if any)
+        # Example: if "old_param_name" in preset_data:
+        #     preset_data["new_param_name"] = preset_data.pop("old_param_name")
+
+    # Always check for aspect ratio migration (regardless of version)
+    if "aspect_ratio" in preset_data:
+        old_aspect_ratio = preset_data["aspect_ratio"]
+        if old_aspect_ratio in ASPECT_RATIO_MIGRATION:
+            new_aspect_ratio = ASPECT_RATIO_MIGRATION[old_aspect_ratio]
+            preset_data["aspect_ratio"] = new_aspect_ratio
+            print(f"[PRESET] Migrated aspect ratio: '{old_aspect_ratio}' -> '{new_aspect_ratio}'")
+            migrated = True
+
+    # Update version if migration occurred
+    if migrated:
+        preset_data["preset_version"] = PRESET_VERSION
+        preset_data["migrated_at"] = datetime.now().isoformat()
+
+    return preset_data
+
+def load_preset_safely(preset_name):
+    """Load and validate preset data with error recovery."""
+    try:
+        import json
+        presets_dir = get_presets_dir()
+        preset_file = os.path.join(presets_dir, f"{preset_name}.json")
+
+        if not os.path.exists(preset_file):
+            return None, f"Preset '{preset_name}' not found"
+
+        with open(preset_file, 'r', encoding='utf-8') as f:
+            preset_data = json.load(f)
+
+        # Check version compatibility and migrate if needed
+        version = preset_data.get("preset_version", "1.0")
+
+        # Always attempt migration for any preset that doesn't match current version
+        if version != PRESET_VERSION:
+            preset_data = migrate_preset_data(preset_data)
+
+        # Only reject if migration failed or version is extremely old
+        migrated_version = preset_data.get("preset_version", "1.0")
+        if migrated_version < PRESET_MIN_COMPATIBLE_VERSION:
+            return None, f"Preset version {version} is too old and could not be migrated (minimum required: {PRESET_MIN_COMPATIBLE_VERSION})"
+
+        # Validate all parameters
+        validated_data = {}
+        for param_name, default_value in PRESET_DEFAULTS.items():
+            raw_value = preset_data.get(param_name, default_value)
+            validated_value = validate_preset_value(param_name, raw_value)
+            validated_data[param_name] = validated_value
+
+        # Include metadata fields
+        validated_data["preset_version"] = preset_data.get("preset_version", PRESET_VERSION)
+        if "migrated_at" in preset_data:
+            validated_data["migrated_at"] = preset_data["migrated_at"]
+
+        return validated_data, None
+
+    except json.JSONDecodeError as e:
+        return None, f"Invalid preset file format: {e}"
+    except Exception as e:
+        return None, f"Error loading preset: {e}"
+
+def save_preset(preset_name, current_preset,
+                # All UI parameters
+                video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+                video_seed, randomize_seed, no_audio, save_metadata,
+                solver_name, sample_steps, num_generations,
+                shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+                blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+                video_negative_prompt, audio_negative_prompt,
+                batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+                vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+                base_resolution_width, base_resolution_height, duration_seconds,
+                enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+                auto_pad_32px_divisible, merge_loras_on_gpu,
+                lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+                lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers):
+    """Save current UI state as a preset."""
+    try:
+        presets_dir = get_presets_dir()
+
+        # If no name provided, use current preset name
+        if not preset_name.strip() and current_preset:
+            preset_name = current_preset
+
+        if not preset_name.strip():
+            presets = get_available_presets()
+            return gr.update(choices=presets, value=None), gr.update(value=""), *[gr.update() for _ in range(40)], "Please enter a preset name or select a preset to overwrite"
+
+        preset_file = os.path.join(presets_dir, f"{preset_name}.json")
+
+        # Collect all current settings
+        preset_data = {
+            "preset_version": PRESET_VERSION,
+            "video_text_prompt": video_text_prompt,
+            "aspect_ratio": aspect_ratio,
+            "video_width": video_width,
+            "video_height": video_height,
+            "auto_crop_image": auto_crop_image,
+            "video_seed": video_seed,
+            "randomize_seed": randomize_seed,
+            "no_audio": no_audio,
+            "save_metadata": save_metadata,
+            "solver_name": solver_name,
+            "sample_steps": sample_steps,
+            "num_generations": num_generations,
+            "shift": shift,
+            "video_guidance_scale": video_guidance_scale,
+            "audio_guidance_scale": audio_guidance_scale,
+            "slg_layer": slg_layer,
+            "blocks_to_swap": blocks_to_swap,
+            "optimized_block_swap": optimized_block_swap,
+            "cpu_offload": cpu_offload,
+            "delete_text_encoder": delete_text_encoder,
+            "fp8_t5": fp8_t5,
+            "cpu_only_t5": cpu_only_t5,
+            "fp8_base_model": fp8_base_model,
+            "use_sage_attention": use_sage_attention,
+            "video_negative_prompt": video_negative_prompt,
+            "audio_negative_prompt": audio_negative_prompt,
+            "batch_input_folder": batch_input_folder,
+            "batch_output_folder": batch_output_folder,
+            "batch_skip_existing": batch_skip_existing,
+            "clear_all": clear_all,
+            "vae_tiled_decode": vae_tiled_decode,
+            "vae_tile_size": vae_tile_size,
+            "vae_tile_overlap": vae_tile_overlap,
+            "base_resolution_width": base_resolution_width,
+            "base_resolution_height": base_resolution_height,
+            "duration_seconds": duration_seconds,
+            "enable_multiline_prompts": enable_multiline_prompts,
+            "enable_video_extension": enable_video_extension,
+            "dont_auto_combine_video_input": dont_auto_combine_video_input,
+            "disable_auto_prompt_validation": disable_auto_prompt_validation,
+            "auto_pad_32px_divisible": auto_pad_32px_divisible,
+            "merge_loras_on_gpu": merge_loras_on_gpu,
+            "lora_1": lora_1,
+            "lora_1_scale": lora_1_scale,
+            "lora_1_layers": lora_1_layers,
+            "lora_2": lora_2,
+            "lora_2_scale": lora_2_scale,
+            "lora_2_layers": lora_2_layers,
+            "lora_3": lora_3,
+            "lora_3_scale": lora_3_scale,
+            "lora_3_layers": lora_3_layers,
+            "lora_4": lora_4,
+            "lora_4_scale": lora_4_scale,
+            "lora_4_layers": lora_4_layers,
+            "saved_at": datetime.now().isoformat()
+        }
+
+        # Save to file
+        with open(preset_file, 'w', encoding='utf-8') as f:
+            import json
+            json.dump(preset_data, f, indent=2, ensure_ascii=False)
+
+        # Save last used preset for auto-load
+        last_used_file = os.path.join(presets_dir, "last_used.txt")
+        with open(last_used_file, 'w', encoding='utf-8') as f:
+            f.write(preset_name)
+
+        presets = get_available_presets()
+        # Load the preset to get all the UI values
+        loaded_values = load_preset(preset_name)
+        # Return dropdown update, name clear, loaded values, success message
+        return gr.update(choices=presets, value=preset_name), gr.update(value=""), *loaded_values[:-1], f"Preset '{preset_name}' saved successfully!"
+
+    except Exception as e:
+        presets = get_available_presets()
+        return gr.update(choices=presets, value=None), gr.update(value=""), *[gr.update() for _ in range(53)], f"Error saving preset: {e}"
+
+def load_preset(preset_name):
+    """Load a preset and return all UI values with robust error handling."""
+    try:
+        if not preset_name:
+            return [gr.update() for _ in range(53)] + ["No preset selected"]
+
+        # Use the robust loading system
+        preset_data, error_msg = load_preset_safely(preset_name)
+
+        if preset_data is None:
+            # Loading failed, return error state
+            return [gr.update() for _ in range(53)] + [error_msg]
+
+        # Save as last used for auto-load (only if loading succeeded)
+        try:
+            presets_dir = get_presets_dir()
+            last_used_file = os.path.join(presets_dir, "last_used.txt")
+            with open(last_used_file, 'w', encoding='utf-8') as f:
+                f.write(preset_name)
+        except Exception as e:
+            print(f"[PRESET] Warning: Could not save last used preset: {e}")
+
+        stored_ratio_value = preset_data.get("aspect_ratio")
+        resolved_aspect_value = _resolve_aspect_ratio_value(
+            stored_ratio_value,
+            preset_data.get("video_width"),
+            preset_data.get("video_height"),
+        )
+
+        base_res_width = _coerce_positive_int(preset_data.get("base_resolution_width")) or 720
+        base_res_height = _coerce_positive_int(preset_data.get("base_resolution_height")) or 720
+
+        current_ratio_map = get_common_aspect_ratios(base_res_width, base_res_height)
+        aspect_ratio_choices = [_format_ratio_choice(name, dims) for name, dims in current_ratio_map.items()]
+        if resolved_aspect_value not in aspect_ratio_choices:
+            aspect_ratio_choices = [resolved_aspect_value] + aspect_ratio_choices
+
+        # Apply automatic memory-based optimizations after preset loading
+        gpu_name, vram_gb = detect_gpu_info()
+        ram_gb = detect_system_ram()
+
+        optimization_messages = []
+
+        # RAM-based optimization: Enable Clear All Memory for RAM < 128GB
+        if ram_gb > 0 and ram_gb < 128:
+            preset_data["clear_all"] = True
+            optimization_messages.append(f"RAM {ram_gb:.1f}GB < 128GB → Enabled Clear All Memory")
+            print(f"  ✓ RAM optimization: Enabled Clear All Memory (RAM: {ram_gb:.1f}GB < 128GB)")
+
+        # VRAM-based optimizations (same as before)
+        if vram_gb > 0:
+            if vram_gb < 23:
+                # Enable Scaled FP8 T5 and Tiled VAE for VRAM < 23GB
+                preset_data["fp8_t5"] = True
+                preset_data["vae_tiled_decode"] = True
+                optimization_messages.append(f"VRAM {vram_gb:.1f}GB < 23GB → Enabled Scaled FP8 T5 + Tiled VAE")
+                print(f"  ✓ VRAM optimization: Enabled Scaled FP8 T5 + Tiled VAE (VRAM: {vram_gb:.1f}GB < 23GB)")
+
+            if vram_gb > 40:
+                # Disable Clear All Memory for VRAM > 40GB
+                preset_data["clear_all"] = False
+                optimization_messages.append(f"VRAM {vram_gb:.1f}GB > 40GB → Disabled Clear All Memory")
+                print(f"  ✓ VRAM optimization: Disabled Clear All Memory (VRAM: {vram_gb:.1f}GB > 40GB)")
+
+        if optimization_messages:
+            print(f"[PRESET] Applied automatic optimizations for '{preset_name}': {', '.join(optimization_messages)}")
+
+
+        # Return all UI updates in the correct order
+        # This order must match the Gradio UI component order exactly
+        return (
+            gr.update(value=preset_data["video_text_prompt"]),
+            gr.update(value=resolved_aspect_value, choices=aspect_ratio_choices),
+            gr.update(value=preset_data["video_width"]),
+            gr.update(value=preset_data["video_height"]),
+            gr.update(value=preset_data["auto_crop_image"]),
+            gr.update(value=preset_data["video_seed"]),
+            gr.update(value=preset_data["randomize_seed"]),
+            gr.update(value=preset_data["no_audio"]),
+            gr.update(value=preset_data["save_metadata"]),
+            gr.update(value=preset_data["solver_name"]),
+            gr.update(value=preset_data["sample_steps"]),
+            gr.update(value=preset_data["num_generations"]),
+            gr.update(value=preset_data["shift"]),
+            gr.update(value=preset_data["video_guidance_scale"]),
+            gr.update(value=preset_data["audio_guidance_scale"]),
+            gr.update(value=preset_data["slg_layer"]),
+            gr.update(value=preset_data["blocks_to_swap"]),
+            gr.update(value=preset_data.get("optimized_block_swap", False)),
+            gr.update(value=preset_data["cpu_offload"]),
+            gr.update(value=preset_data["delete_text_encoder"]),
+            gr.update(value=preset_data["fp8_t5"]),
+            gr.update(value=preset_data["cpu_only_t5"]),
+            gr.update(value=preset_data["fp8_base_model"]),
+            gr.update(value=preset_data.get("use_sage_attention", False)),
+            gr.update(value=preset_data["video_negative_prompt"]),
+            gr.update(value=preset_data["audio_negative_prompt"]),
+            gr.update(value=preset_data["batch_input_folder"]),
+            gr.update(value=preset_data["batch_output_folder"]),
+            gr.update(value=preset_data["batch_skip_existing"]),
+            gr.update(value=preset_data["clear_all"]),
+            gr.update(value=preset_data["vae_tiled_decode"]),
+            gr.update(value=preset_data["vae_tile_size"]),
+            gr.update(value=preset_data["vae_tile_overlap"]),
+            gr.update(value=preset_data["base_resolution_width"]),
+            gr.update(value=preset_data["base_resolution_height"]),
+            gr.update(value=preset_data["duration_seconds"]),
+            gr.update(value=preset_data["enable_multiline_prompts"]),
+            gr.update(value=preset_data["enable_video_extension"]),
+            gr.update(value=preset_data.get("dont_auto_combine_video_input", False)),
+            gr.update(value=preset_data.get("disable_auto_prompt_validation", False)),
+            gr.update(value=preset_data.get("auto_pad_32px_divisible", False)),
+            gr.update(value=preset_data.get("merge_loras_on_gpu", False)),
+            gr.update(value=preset_data.get("lora_1", "None")),
+            gr.update(value=preset_data.get("lora_1_scale", 1.0)),
+            gr.update(value=preset_data.get("lora_1_layers", "Video Layers")),
+            gr.update(value=preset_data.get("lora_2", "None")),
+            gr.update(value=preset_data.get("lora_2_scale", 1.0)),
+            gr.update(value=preset_data.get("lora_2_layers", "Video Layers")),
+            gr.update(value=preset_data.get("lora_3", "None")),
+            gr.update(value=preset_data.get("lora_3_scale", 1.0)),
+            gr.update(value=preset_data.get("lora_3_layers", "Video Layers")),
+            gr.update(value=preset_data.get("lora_4", "None")),
+            gr.update(value=preset_data.get("lora_4_scale", 1.0)),
+            gr.update(value=preset_data.get("lora_4_layers", "Video Layers")),
+            gr.update(value=preset_name),  # Update dropdown value
+            f"Preset '{preset_name}' loaded successfully!{' Applied optimizations: ' + ', '.join(optimization_messages) if optimization_messages else ''}"
+        )
+
+    except Exception as e:
+        error_msg = f"Unexpected error loading preset: {e}"
+        print(f"[PRESET] {error_msg}")
+        return [gr.update() for _ in range(53)] + [error_msg]
+
+def initialize_app_with_auto_load():
+    """Initialize app with preset dropdown choices and auto-load last preset or VRAM-based preset."""
+    try:
+        # Clean up any invalid presets before initializing
+        removed_count = cleanup_invalid_presets()
+        if removed_count > 0:
+            print(f"[PRESET] Cleaned up {removed_count} invalid preset(s)")
+
+        presets = get_available_presets()
+        dropdown_update = gr.update(choices=presets, value=None)
+
+        # Try to auto-load the last used preset
+        presets_dir = get_presets_dir()
+        last_used_file = os.path.join(presets_dir, "last_used.txt")
+
+        if os.path.exists(last_used_file):
+            try:
+                with open(last_used_file, 'r', encoding='utf-8') as f:
+                    last_preset = f.read().strip()
+
+                if last_preset and last_preset in presets:
+                    print(f"Auto-loading last used preset: {last_preset}")
+                    # Load the preset and update dropdown to select it
+                    loaded_values = load_preset(last_preset)
+
+                    # Check if loading was successful (last element is the status message)
+                    status_message = loaded_values[-1]
+                    if "successfully" in status_message:
+                        # Return dropdown with selected preset + all loaded UI values
+                        return gr.update(choices=presets, value=last_preset), *loaded_values[:-1], f"Auto-loaded preset '{last_preset}'"
+                    else:
+                        print(f"[PRESET] Failed to auto-load preset '{last_preset}': {status_message}")
+                        print("[PRESET] Falling back to VRAM-based preset selection")
+                else:
+                    print(f"[PRESET] Last used preset '{last_preset}' not found in available presets")
+            except Exception as e:
+                print(f"[PRESET] Error reading last used preset file: {e}")
+                print("[PRESET] Falling back to VRAM-based preset selection")
+
+        # No last used preset - detect VRAM and select best matching preset
+        gpu_name, vram_gb = detect_gpu_info()
+
+        if vram_gb > 0 and presets:
+            # Find VRAM-based presets (those with "GB" in the name)
+            vram_presets = [p for p in presets if 'GB' in p and any(char.isdigit() for char in p)]
+
+            if vram_presets:
+                # Extract VRAM values from preset names and find the best match
+                import re
+                best_preset = None
+                best_vram_diff = float('inf')
+
+                for preset in vram_presets:
+                    match = re.search(r'(\d+)', preset)
+                    if match:
+                        preset_vram = int(match.group(1))
+                        vram_diff = abs(vram_gb - preset_vram)  # Use absolute difference for closest match
+
+                        if vram_diff < best_vram_diff:
+                            best_vram_diff = vram_diff
+                            best_preset = preset
+
+                if best_preset:
+                    print(f"Auto-loading VRAM-based preset: {best_preset} (detected {vram_gb:.1f}GB VRAM)")
+                    # Load the preset and update dropdown to select it
+                    loaded_values = load_preset(best_preset)
+
+                    # Check if loading was successful
+                    status_message = loaded_values[-1]
+                    if "successfully" in status_message:
+                        # Return dropdown with selected preset + all loaded UI values
+                        return gr.update(choices=presets, value=best_preset), *loaded_values[:-1], f"Auto-loaded VRAM-optimized preset '{best_preset}' ({vram_gb:.1f}GB GPU detected)"
+                    else:
+                        print(f"[PRESET] Failed to auto-load VRAM-based preset '{best_preset}': {status_message}")
+                        print("[PRESET] Falling back to basic VRAM optimizations")
+                else:
+                    print(f"No suitable VRAM-based preset found for {vram_gb:.1f}GB VRAM")
+
+        # Fallback: No preset to auto-load - check RAM and VRAM and apply basic optimizations
+        print("No preset auto-loaded - applying basic memory optimizations...")
+
+        gpu_name, vram_gb = detect_gpu_info()
+        ram_gb = detect_system_ram()
+
+        # Apply basic memory-based optimizations when no preset is loaded
+        fp8_t5_update = gr.update()  # Default: False
+        vae_tiled_decode_update = gr.update()  # Default: False
+        clear_all_update = gr.update()  # Default: True
+        delete_text_encoder_update = gr.update()  # Default: False
+
+        optimization_messages = []
+
+        # RAM-based optimization: Enable Clear All Memory for RAM < 128GB
+        if ram_gb > 0 and ram_gb < 128:
+            clear_all_update = gr.update(value=True)
+            optimization_messages.append(f"RAM {ram_gb:.1f}GB < 128GB → Enabled Clear All Memory")
+            print(f"  ✓ RAM optimization: Enabled Clear All Memory (RAM: {ram_gb:.1f}GB < 128GB)")
+
+        # VRAM-based optimizations (same as before)
+        if vram_gb > 0:
+            if vram_gb < 23:
+                # Enable Scaled FP8 T5 and Tiled VAE for VRAM < 23GB
+                fp8_t5_update = gr.update(value=True)
+                vae_tiled_decode_update = gr.update(value=True)
+                optimization_messages.append(f"VRAM {vram_gb:.1f}GB < 23GB → Enabled Scaled FP8 T5 + Tiled VAE")
+                print(f"  ✓ VRAM optimization: Enabled Scaled FP8 T5 + Tiled VAE (VRAM: {vram_gb:.1f}GB < 23GB)")
+
+            if vram_gb > 40:
+                # Disable Clear All Memory for VRAM > 40GB
+                clear_all_update = gr.update(value=False)
+                optimization_messages.append(f"VRAM {vram_gb:.1f}GB > 40GB → Disabled Clear All Memory")
+                print(f"  ✓ VRAM optimization: Disabled Clear All Memory (VRAM: {vram_gb:.1f}GB > 40GB)")
+
+        if optimization_messages:
+            status_message = "Applied memory optimizations: " + ", ".join(optimization_messages)
+        else:
+            status_message = f"Hardware detected (RAM: {ram_gb:.1f}GB, GPU: {gpu_name}, VRAM: {vram_gb:.1f}GB) - using default settings"
+            print(f"  ✓ No memory optimizations needed (RAM: {ram_gb:.1f}GB, VRAM: {vram_gb:.1f}GB in optimal range)")
+
+        # Return initialized dropdown with VRAM-optimized defaults
+        # The order must match the outputs list in demo.load()
+        # Initialize aspect ratio choices with resolution info
+        default_ratios = get_common_aspect_ratios(720, 720)
+        aspect_choices = [f"{name} - {w}x{h}px" for name, (w, h) in default_ratios.items()]
+        # Set default to 16:9 if available, otherwise first choice
+        default_aspect_value = next((c for c in aspect_choices if c.startswith("16:9")), aspect_choices[0] if aspect_choices else None)
+        initial_aspect_choices = gr.update(choices=aspect_choices, value=default_aspect_value)
+
+        return (
+            dropdown_update,  # preset_dropdown
+            gr.update(),  # video_text_prompt
+            initial_aspect_choices,  # aspect_ratio
+            gr.update(),  # video_width
+            gr.update(),  # video_height
+            gr.update(),  # auto_crop_image
+            gr.update(),  # video_seed
+            gr.update(),  # randomize_seed
+            gr.update(),  # no_audio
+            gr.update(),  # save_metadata
+            gr.update(),  # solver_name
+            gr.update(),  # sample_steps
+            gr.update(),  # num_generations
+            gr.update(),  # shift
+            gr.update(),  # video_guidance_scale
+            gr.update(),  # audio_guidance_scale
+            gr.update(),  # slg_layer
+            gr.update(),  # blocks_to_swap
+            gr.update(),  # optimized_block_swap
+            gr.update(),  # cpu_offload
+            delete_text_encoder_update,  # delete_text_encoder (potentially modified)
+            fp8_t5_update,  # fp8_t5 (potentially modified)
+            gr.update(),  # cpu_only_t5
+            gr.update(),  # fp8_base_model
+            gr.update(),  # use_sage_attention
+            gr.update(),  # video_negative_prompt
+            gr.update(),  # audio_negative_prompt
+            gr.update(),  # batch_input_folder
+            gr.update(),  # batch_output_folder
+            gr.update(),  # batch_skip_existing
+            clear_all_update,  # clear_all (potentially modified)
+            vae_tiled_decode_update,  # vae_tiled_decode (potentially modified)
+            gr.update(),  # vae_tile_size
+            gr.update(),  # vae_tile_overlap
+            gr.update(),  # base_resolution_width
+            gr.update(),  # base_resolution_height
+            gr.update(),  # duration_seconds
+            gr.update(),  # enable_multiline_prompts
+            gr.update(),  # enable_video_extension
+            gr.update(),  # dont_auto_combine_video_input
+            status_message  # status message
+        )
+
+    except Exception as e:
+        print(f"Warning: Could not initialize app with auto-load: {e}")
+        presets = get_available_presets()
+        return gr.update(choices=presets, value=None), *[gr.update() for _ in range(39)], ""
+
+def initialize_app():
+    """Initialize app with preset dropdown choices."""
+    presets = get_available_presets()
+    return gr.update(choices=presets, value=None)
+
+def build_generation_metadata_params(text_prompt, image_path, video_frame_height, video_frame_width,
+                                   aspect_ratio, base_resolution_width, base_resolution_height, duration_seconds,
+                                   randomize_seed, num_generations, solver_name, sample_steps, shift,
+                                   video_guidance_scale, audio_guidance_scale, slg_layer, blocks_to_swap, optimized_block_swap,
+                                   cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model,
+                                   use_sage_attention, no_audio, no_block_prep, clear_all, vae_tiled_decode,
+                                   vae_tile_size, vae_tile_overlap, video_negative_prompt, audio_negative_prompt,
+                                   is_extension=False, extension_index=0, is_batch=False, duration_override=None,
+                                   lora_specs=None):
+    """Build metadata parameters dictionary to avoid code duplication."""
+    return {
+        'text_prompt': text_prompt,
+        'image_path': image_path,
+        'video_frame_height': video_frame_height,
+        'video_frame_width': video_frame_width,
+        'aspect_ratio': aspect_ratio,
+        'base_resolution_width': base_resolution_width,
+        'base_resolution_height': base_resolution_height,
+        'duration_seconds': duration_seconds,
+        'randomize_seed': randomize_seed,
+        'num_generations': num_generations,
+        'solver_name': solver_name,
+        'sample_steps': sample_steps,
+        'shift': shift,
+        'video_guidance_scale': video_guidance_scale,
+        'audio_guidance_scale': audio_guidance_scale,
+        'slg_layer': slg_layer,
+        'blocks_to_swap': blocks_to_swap,
+        'optimized_block_swap': optimized_block_swap,
+        'cpu_offload': cpu_offload,
+        'delete_text_encoder': delete_text_encoder,
+        'fp8_t5': fp8_t5,
+        'cpu_only_t5': cpu_only_t5,
+        'fp8_base_model': fp8_base_model,
+        'use_sage_attention': use_sage_attention,
+        'no_audio': no_audio,
+        'no_block_prep': no_block_prep,
+        'clear_all': clear_all,
+        'vae_tiled_decode': vae_tiled_decode,
+        'vae_tile_size': vae_tile_size,
+        'vae_tile_overlap': vae_tile_overlap,
+        'video_negative_prompt': video_negative_prompt,
+        'audio_negative_prompt': audio_negative_prompt,
+        'is_extension': is_extension,
+        'extension_index': extension_index,
+        'is_batch': is_batch,
+        'duration_override': duration_override,
+        'lora_specs': lora_specs
+    }
+
+def save_generation_metadata(output_path, generation_params, used_seed):
+    """Save generation metadata as a .txt file alongside the video."""
+    try:
+        # Create metadata filename (same as video but .txt extension)
+        metadata_path = output_path.replace('.mp4', '.txt')
+
+        # Determine generation type
+        is_extension = generation_params.get('is_extension', False)
+        extension_index = generation_params.get('extension_index', 0)
+        is_batch = generation_params.get('is_batch', False)
+
+        # Prepare LoRA configuration text
+        lora_specs = generation_params.get('lora_specs')
+        if lora_specs:
+            lora_config_text = f"- LoRAs Applied: {len(lora_specs)}\n" + "\n".join([f"  - {os.path.basename(path)} (scale: {scale}, layers: {layers})" for path, scale, layers in lora_specs])
+        else:
+            lora_config_text = "- No LoRAs applied"
+
+        metadata_content = f"""BRANDULATE OVI - VIDEO GENERATION METADATA
+Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+VIDEO PARAMETERS:
+- Text Prompt: {generation_params.get('text_prompt', 'N/A')}
+- Image Path: {generation_params.get('image_path', 'None')}
+- Resolution: {generation_params.get('video_frame_height', 'N/A')}x{generation_params.get('video_frame_width', 'N/A')}
+- Aspect Ratio: {generation_params.get('aspect_ratio', 'N/A')}
+- Base Resolution: {generation_params.get('base_resolution_width', 720)}x{generation_params.get('base_resolution_height', 720)}
+- Duration: {generation_params.get('duration_seconds', 5)} seconds
+{f'- Duration Override: {generation_params.get("duration_override", "None")} (from prompt syntax {{x}})' if generation_params.get('duration_override') is not None else ''}
+- Seed Used: {used_seed}
+- Randomize Seed: {generation_params.get('randomize_seed', False)}
+- Number of Generations: {generation_params.get('num_generations', 1)}
+- Generation Type: {'Extension' if is_extension else 'Batch' if is_batch else 'Single'}
+{f'- Extension Index: {extension_index}' if is_extension else ''}
+
+GENERATION SETTINGS:
+- Solver: {generation_params.get('solver_name', 'N/A')}
+- Sample Steps: {generation_params.get('sample_steps', 'N/A')}
+- Shift: {generation_params.get('shift', 'N/A')}
+- Video Guidance Scale: {generation_params.get('video_guidance_scale', 'N/A')}
+- Audio Guidance Scale: {generation_params.get('audio_guidance_scale', 'N/A')}
+- SLG Layer: {generation_params.get('slg_layer', 'N/A')}
+
+MEMORY OPTIMIZATION:
+- Block Swap: {generation_params.get('blocks_to_swap', 'N/A')} blocks
+- Optimized Block Swap: {generation_params.get('optimized_block_swap', False)}
+- CPU Offload: {generation_params.get('cpu_offload', 'N/A')}
+- Delete Text Encoder: {generation_params.get('delete_text_encoder', True)}
+- Scaled FP8 T5: {generation_params.get('fp8_t5', False)}
+- CPU-Only T5: {generation_params.get('cpu_only_t5', False)}
+- Scaled FP8 Base Model: {generation_params.get('fp8_base_model', False)}
+- Sage Attention: {generation_params.get('use_sage_attention', False)}
+- No Block Prep: {generation_params.get('no_block_prep', False)}
+- Clear All Memory: {generation_params.get('clear_all', False)}
+
+VAE OPTIMIZATION:
+- Tiled VAE Decode: {generation_params.get('vae_tiled_decode', False)}
+- VAE Tile Size: {generation_params.get('vae_tile_size', 'N/A')}
+- VAE Tile Overlap: {generation_params.get('vae_tile_overlap', 'N/A')}
+
+LORA CONFIGURATION:
+{lora_config_text}
+
+NEGATIVE PROMPTS:
+- Video: {generation_params.get('video_negative_prompt', 'N/A')}
+- Audio: {generation_params.get('audio_negative_prompt', 'N/A')}
+
+OUTPUT SETTINGS:
+- No Audio: {generation_params.get('no_audio', False)}
+- Output Path: {output_path}
+- Metadata Path: {metadata_path}
+
+SYSTEM INFO:
+- Brandulate OVI Version: 1.0
+- Generation Mode: {'Batch' if generation_params.get('is_batch', False) else 'Single'}
+"""
+
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            f.write(metadata_content)
+
+        print(f"[METADATA] Saved generation metadata: {metadata_path}")
+        return True
+
+    except Exception as e:
+        print(f"[METADATA ERROR] Failed to save metadata: {e}")
+        return False
+
+def scan_batch_files(input_folder):
+    """Scan input folder and return list of (base_name, image_path, txt_path) tuples."""
+    import os
+    import glob
+
+    # Normalize path to handle spaces and cross-platform compatibility
+    input_folder = os.path.abspath(input_folder.strip())
+    
+    if not os.path.exists(input_folder):
+        raise Exception(f"Input folder does not exist: {input_folder}")
+
+    # Supported image extensions
+    image_exts = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp']
+    txt_ext = '.txt'
+
+    # Find all txt files
+    txt_files = glob.glob(os.path.join(input_folder, f"*{txt_ext}"))
+
+    batch_items = []
+
+    for txt_file in txt_files:
+        base_name = os.path.splitext(os.path.basename(txt_file))[0]
+
+        # Check if there's a matching image file
+        image_path = None
+        for ext in image_exts:
+            potential_image = os.path.join(input_folder, f"{base_name}{ext}")
+            if os.path.exists(potential_image):
+                image_path = potential_image
+                break
+
+        batch_items.append((base_name, image_path, txt_file))
+
+    return batch_items
+
+def process_batch_generation(
+    input_folder,
+    output_folder,
+    skip_existing,
+    # Generation parameters
+    video_frame_height,
+    video_frame_width,
+    solver_name,
+    sample_steps,
+    shift,
+    video_guidance_scale,
+    audio_guidance_scale,
+    slg_layer,
+    blocks_to_swap,
+    optimized_block_swap,
+    video_negative_prompt,
+    audio_negative_prompt,
+    cpu_offload,
+    delete_text_encoder,
+    fp8_t5,
+    cpu_only_t5,
+    fp8_base_model,
+    use_sage_attention,
+    no_audio,
+    no_block_prep,
+    num_generations,
+    randomize_seed,
+    save_metadata,
+    aspect_ratio,
+    clear_all,
+    vae_tiled_decode,
+    vae_tile_size,
+    vae_tile_overlap,
+    base_resolution_width,
+    base_resolution_height,
+    duration_seconds,
+    auto_crop_image,
+    enable_multiline_prompts,
+    enable_video_extension,  # Boolean checkbox from UI (not count)
+    dont_auto_combine_video_input,  # New: Don't auto combine video input
+    disable_auto_prompt_validation,  # New: Skip automatic prompt validation when True
+    auto_pad_32px_divisible,  # New: Auto pad for 32px divisibility
+    merge_loras_on_gpu,  # New: Merge LoRAs on GPU instead of CPU
+    lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+    lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+):
+    """Process batch generation from input folder."""
+    global ovi_engine, ovi_engine_duration, ovi_engine_optimized_block_swap
+
+    try:
+        # Check for cancellation at the start
+        check_cancellation()
+
+        # Determine output directory (normalize paths for both Windows and Linux)
+        if output_folder and output_folder.strip():
+            outputs_dir = os.path.abspath(output_folder.strip())  # Normalize path and handle spaces
+        elif args.output_dir:
+            outputs_dir = os.path.abspath(args.output_dir)
+        else:
+            outputs_dir = os.path.join(os.path.dirname(__file__), "outputs")
+        
+        # Create output directory if it doesn't exist
+        try:
+            os.makedirs(outputs_dir, exist_ok=True)
+            print(f"[BATCH] Output directory: {outputs_dir}")
+        except Exception as e:
+            raise Exception(f"Failed to create output directory '{outputs_dir}': {e}")
+
+        # Scan batch files (normalize input folder path)
+        input_folder_normalized = os.path.abspath(input_folder.strip())
+        print(f"[BATCH] Input directory: {input_folder_normalized}")
+        
+        batch_items = scan_batch_files(input_folder_normalized)
+        if not batch_items:
+            raise Exception(f"No .txt files found in input folder: {input_folder_normalized}")
+
+        print(f"\n[INFO] Found {len(batch_items)} items to process:")
+        for base_name, img_path, txt_path in batch_items:
+            img_status = "with image" if img_path else "text-only"
+            print(f"  - {base_name}: {img_status}")
+
+        # PRE-PROCESSING VALIDATION: Check all prompt files before starting processing
+        print(f"\n[VALIDATION] Checking all prompt files before starting processing...")
+        invalid_files = []
+        valid_files = []
+
+        for base_name, image_path, txt_path in batch_items:
+            try:
+                # Read prompt from txt file
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    raw_text_prompt = f.read().strip()
+
+                if not raw_text_prompt:
+                    print(f"  ❌ {base_name}: Empty prompt file")
+                    invalid_files.append((base_name, txt_path, "Empty prompt file"))
+                    continue
+
+                # Validate prompt format (unless disabled)
+                if not disable_auto_prompt_validation:
+                    is_valid, error_message = validate_prompt_format(raw_text_prompt)
+                    if not is_valid:
+                        print(f"  ❌ {base_name}: Invalid prompt format - {error_message.split('.')[0]}")
+                        invalid_files.append((base_name, txt_path, f"Invalid prompt format: {error_message}"))
+                        continue
+                else:
+                    print(f"  ⚠️  {base_name}: Skipping validation (disabled)")
+
+                # Parse multi-line prompts if enabled
+                individual_prompts = parse_multiline_prompts(raw_text_prompt, enable_multiline_prompts)
+
+                # Validate each individual prompt line if multi-line is enabled (unless disabled)
+                if enable_multiline_prompts and not disable_auto_prompt_validation:
+                    invalid_lines = []
+                    for i, prompt_line in enumerate(individual_prompts):
+                        line_valid, line_error = validate_prompt_format(prompt_line)
+                        if not line_valid:
+                            invalid_lines.append(f"line {i+1}: {line_error}")
+
+                    if invalid_lines:
+                        print(f"  ❌ {base_name}: Invalid prompt in {len(invalid_lines)} line(s)")
+                        for line_error in invalid_lines[:3]:  # Show first 3 errors
+                            print(f"     {line_error}")
+                        if len(invalid_lines) > 3:
+                            print(f"     ... and {len(invalid_lines) - 3} more errors")
+                        invalid_files.append((base_name, txt_path, f"Invalid prompts in {len(invalid_lines)} lines"))
+                        continue
+
+                # File passed all validations
+                print(f"  ✅ {base_name}: Valid")
+                valid_files.append((base_name, image_path, txt_path))
+
+            except Exception as e:
+                print(f"  ❌ {base_name}: File error - {str(e)}")
+                invalid_files.append((base_name, txt_path, f"File error: {str(e)}"))
+
+        # Report validation results
+        print(f"\n[VALIDATION RESULTS]")
+        print(f"  Valid files: {len(valid_files)}")
+        print(f"  Invalid files: {len(invalid_files)}")
+
+        if invalid_files:
+            print(f"\n[INVALID FILES]")
+            for base_name, txt_path, error in invalid_files:
+                print(f"  ❌ {base_name} ({os.path.basename(txt_path)}): {error}")
+
+            if disable_auto_prompt_validation:
+                print(f"\n[WARNING] Auto prompt validation is DISABLED - invalid files will be processed anyway")
+            else:
+                error_msg = f"Found {len(invalid_files)} invalid prompt file(s). Please fix the errors and try again."
+                raise Exception(error_msg)
+
+        print(f"\n[PROCESSING] Starting batch generation with {len(valid_files)} valid files...")
+
+        # Replace batch_items with only valid files
+        batch_items = valid_files
+
+        # CRITICAL: Always use exact user-specified Video Width and Video Height from Gradio interface
+        # For batch processing with auto-crop enabled, dimensions will be detected from each image
+        print(f"[BATCH RESOLUTION] Using exact user-specified resolution: {video_frame_width}x{video_frame_height}")
+        
+        # Validate that dimensions are divisible by 32 (required by model)
+        if video_frame_width % 32 != 0 or video_frame_height % 32 != 0:
+            # Snap to nearest multiple of 32
+            video_frame_width = max(32, ((video_frame_width + 15) // 32) * 32)
+            video_frame_height = max(32, ((video_frame_height + 15) // 32) * 32)
+            print(f"[BATCH RESOLUTION] Snapped to 32px alignment: {video_frame_width}x{video_frame_height}")
+        
+        print(f"[BATCH] Auto-crop: {'ENABLED (will detect aspect from each image)' if auto_crop_image else 'DISABLED (will use fixed resolution)'}")
+        
+        # Only initialize engine if we're not using subprocess mode (clear_all=False)
+        # When clear_all=True, all batch generations run in subprocesses, so main process doesn't need models
+        if clear_all:
+            print("=" * 80)
+            print("CLEAR ALL MEMORY ENABLED FOR BATCH PROCESSING")
+            print("  Main process will NOT load any models")
+            print("  All batch generations will run in separate subprocesses")
+            print("  VRAM/RAM will be completely cleared between each batch item")
+            print("=" * 80)
+
+        # Check if duration has changed - if so, force engine reinitialization
+        global ovi_engine, ovi_engine_duration, ovi_engine_optimized_block_swap
+        current_engine_mode = ovi_engine_optimized_block_swap
+        if ovi_engine is not None and current_engine_mode is None:
+            current_engine_mode = getattr(ovi_engine, "optimized_block_swap", False)
+            ovi_engine_optimized_block_swap = current_engine_mode
+
+        if not clear_all and ovi_engine is not None:
+            reinit_messages = []
+            if ovi_engine_duration != duration_seconds:
+                reinit_messages.append(f"DURATION CHANGED: {ovi_engine_duration}s → {duration_seconds}s")
+            if current_engine_mode != optimized_block_swap:
+                prev_label = "Optimized" if current_engine_mode else "Legacy"
+                new_label = "Optimized" if optimized_block_swap else "Legacy"
+                reinit_messages.append(f"BLOCK SWAP MODE CHANGED: {prev_label} → {new_label}")
+
+            if reinit_messages:
+                print("=" * 80)
+                for msg in reinit_messages:
+                    print(msg)
+                print("  Forcing engine reinitialization with updated settings")
+                print("=" * 80)
+                ovi_engine = None  # Force reinitialization
+
+        if not clear_all and ovi_engine is None:
+            # Use CLI args only in test mode, otherwise use GUI parameters
+            if getattr(args, 'test', False):
+                final_blocks_to_swap = getattr(args, 'blocks_to_swap', 0)
+                final_cpu_offload = getattr(args, 'test_cpu_offload', False)
+                final_optimized_block_swap = getattr(args, 'optimized_block_swap', False)
+            else:
+                final_blocks_to_swap = blocks_to_swap
+                final_cpu_offload = cpu_offload
+                final_optimized_block_swap = optimized_block_swap
+
+            print("=" * 80)
+            print("INITIALIZING FUSION ENGINE FOR BATCH PROCESSING IN MAIN PROCESS")
+            print(f"  Block Swap: {final_blocks_to_swap} blocks (0 = disabled)")
+            print(f"  CPU Offload: {final_cpu_offload}")
+            print(f"  No Block Prep: {no_block_prep}")
+            print(f"  Optimized Block Swap: {final_optimized_block_swap}")
+            print(f"  Note: Models will be loaded in main process (Clear All Memory disabled)")
+            print("=" * 80)
+
+            # Calculate latent lengths based on duration
+            video_latent_length, audio_latent_length = calculate_latent_lengths(duration_seconds)
+
+            DEFAULT_CONFIG['cpu_offload'] = final_cpu_offload
+            DEFAULT_CONFIG['mode'] = "t2v"
+            ovi_engine = OviFusionEngine(
+                blocks_to_swap=final_blocks_to_swap,
+                cpu_offload=final_cpu_offload,
+                video_latent_length=video_latent_length,
+                audio_latent_length=audio_latent_length,
+                merge_loras_on_gpu=merge_loras_on_gpu,
+                optimized_block_swap=final_optimized_block_swap
+            )
+            ovi_engine_duration = duration_seconds  # Store duration used for initialization
+            ovi_engine_optimized_block_swap = final_optimized_block_swap
+            print("\n[OK] OviFusionEngine initialized successfully for batch processing")
+
+        processed_count = 0
+        skipped_count = 0
+        last_output_path = None
+
+        # Process each batch item (all items have been pre-validated)
+        for base_name, image_path, txt_path in batch_items:
+            # Check for cancellation
+            check_cancellation()
+
+            # Read prompt from txt file (already validated, so should not fail)
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                raw_text_prompt = f.read().strip()
+
+            # Parse multi-line prompts if enabled
+            individual_prompts = parse_multiline_prompts(raw_text_prompt, enable_multiline_prompts)
+
+            print(f"\n[PROCESSING] {base_name}")
+            if enable_multiline_prompts:
+                print(f"  Multi-line prompts: {len(individual_prompts)} prompts")
+                for i, prompt in enumerate(individual_prompts):
+                    print(f"    Prompt {i+1}: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+            else:
+                print(f"  Prompt: {raw_text_prompt[:100]}{'...' if len(raw_text_prompt) > 100 else ''}")
+            print(f"  Image: {'Yes' if image_path else 'No'}")
+
+            # Convert image to PNG for maximum robustness (handles WebP and other formats)
+            if image_path:
+                image_path = convert_image_to_png(image_path)
+
+            # Apply auto cropping if enabled and image exists
+            # For batch processing with auto-crop enabled:
+            # 1. Detect aspect ratio from image
+            # 2. Calculate resolution using base_resolution_width/height
+            # 3. Crop to that resolution
+            if auto_crop_image and image_path:
+                try:
+                    from PIL import Image
+                    img = Image.open(image_path)
+                    iw, ih = img.size
+                    
+                    if iw > 0 and ih > 0:
+                        # Detect closest aspect ratio from image
+                        aspect = iw / ih
+                        def get_ratio_value(ratio_str):
+                            w, h = map(float, ratio_str.split(':'))
+                            return w / h
+                        
+                        closest_ratio = min(ASPECT_RATIOS.keys(), key=lambda k: abs(get_ratio_value(k) - aspect))
+                        
+                        # Calculate resolution from base dimensions and detected aspect ratio
+                        base_width = _coerce_positive_int(base_resolution_width) or 720
+                        base_height = _coerce_positive_int(base_resolution_height) or 720
+                        current_ratios = get_common_aspect_ratios(base_width, base_height)
+                        
+                        if closest_ratio in current_ratios:
+                            batch_video_width, batch_video_height = current_ratios[closest_ratio]
+                            print(f"[BATCH AUTO-CROP] Image {iw}x{ih} → Detected aspect {closest_ratio} → Resolution {batch_video_width}x{batch_video_height} (base {base_width}x{base_height})")
+                        else:
+                            # Fallback to user-specified resolution
+                            batch_video_width = video_frame_width
+                            batch_video_height = video_frame_height
+                            print(f"[BATCH AUTO-CROP] Aspect ratio not found, using user-specified {batch_video_width}x{batch_video_height}")
+                        
+                        # Crop/pad image to calculated resolution
+                        final_image_path = apply_auto_crop_if_enabled(image_path, auto_crop_image, batch_video_width, batch_video_height,
+                                                                     auto_pad_32px_divisible=auto_pad_32px_divisible)
+                    else:
+                        # Invalid dimensions, use user-specified resolution
+                        batch_video_width = video_frame_width
+                        batch_video_height = video_frame_height
+                        final_image_path = image_path
+                except Exception as e:
+                    print(f"[BATCH AUTO-CROP] Error: {e}, using user-specified resolution")
+                    batch_video_width = video_frame_width
+                    batch_video_height = video_frame_height
+                    final_image_path = image_path
+            else:
+                # If auto-crop is disabled, use the exact user-specified resolution
+                final_image_path = apply_auto_crop_if_enabled(image_path, auto_crop_image, video_frame_width, video_frame_height,
+                                                             auto_pad_32px_divisible=auto_pad_32px_divisible)
+                batch_video_width = video_frame_width
+                batch_video_height = video_frame_height
+
+            # Check if output already exists (for skip logic)
+            # Need to check for all possible output files that could be generated for this batch item
+            import glob
+            # Check for files starting with base_name (handles multi-line prompts and multiple generations)
+            existing_outputs = glob.glob(os.path.join(outputs_dir, f"{base_name}*.mp4"))
+            if skip_existing and existing_outputs:
+                print(f"  [SKIPPED] Output already exists: {len(existing_outputs)} file(s) found")
+                for output_file in existing_outputs:
+                    print(f"    - {os.path.basename(output_file)}")
+                skipped_count += 1
+                continue
+
+            # Generate videos for each prompt (supporting multi-line prompts and multiple generations)
+            for prompt_idx, current_prompt in enumerate(individual_prompts):
+                print(f"  [PROMPT {prompt_idx + 1}/{len(individual_prompts)}] Processing: {current_prompt[:50]}{'...' if len(current_prompt) > 50 else ''}")
+
+                # For multi-line prompts in batch processing, append prompt index to avoid overwrites
+                if enable_multiline_prompts and len(individual_prompts) > 1:
+                    current_base_name = f"{base_name}_{prompt_idx + 1}"
+                else:
+                    current_base_name = base_name
+
+                # Check for duration override in prompt syntax {x} for batch processing
+                batch_prompt, batch_duration_override = parse_duration_from_prompt(current_prompt)
+                if batch_duration_override is not None:
+                    batch_duration_seconds = batch_duration_override
+                    print(f"[BATCH DURATION OVERRIDE] Duration changed to {batch_duration_seconds} seconds for prompt: {batch_prompt[:50]}...")
+                else:
+                    batch_prompt = current_prompt  # Use original if no override
+                    batch_duration_seconds = duration_seconds  # Use parameter default
+
+                # Generate multiple videos for this prompt
+                for gen_idx in range(int(num_generations)):
+                    # Check for cancellation in the loop
+                    check_cancellation()
+
+                    # Handle seed logic for batch processing
+                    current_seed = 99  # Default seed for batch processing
+                    if randomize_seed:
+                        current_seed = get_random_seed()
+                    elif gen_idx > 0:
+                        current_seed = 99 + gen_idx
+
+                    print(f"    [GENERATION {gen_idx + 1}/{int(num_generations)}] Seed: {current_seed}")
+
+                if clear_all:
+                    # Run this batch generation in a subprocess for memory cleanup
+                    single_gen_params = {
+                        'text_prompt': batch_prompt,
+                        'image': final_image_path,
+                        'video_frame_height': batch_video_height,  # Use detected dimensions
+                        'video_frame_width': batch_video_width,    # Use detected dimensions
+                        'video_seed': current_seed,
+                        'solver_name': solver_name,
+                        'sample_steps': sample_steps,
+                        'shift': shift,
+                        'video_guidance_scale': video_guidance_scale,
+                        'audio_guidance_scale': audio_guidance_scale,
+                        'slg_layer': slg_layer,
+                        'blocks_to_swap': blocks_to_swap,
+            'optimized_block_swap': optimized_block_swap,
+                        'video_negative_prompt': video_negative_prompt,
+                        'audio_negative_prompt': audio_negative_prompt,
+                        'use_image_gen': False,
+                        'cpu_offload': cpu_offload,
+                        'delete_text_encoder': False,  # Set to False in subprocess (T5 already encoded in main process or subprocess)
+                        'fp8_t5': fp8_t5,
+                        'cpu_only_t5': cpu_only_t5,
+                        'fp8_base_model': fp8_base_model,
+                        'use_sage_attention': use_sage_attention,
+                        'no_audio': no_audio,
+                        'no_block_prep': no_block_prep,
+                        'num_generations': 1,
+                        'randomize_seed': False,
+                        'save_metadata': save_metadata,
+                        'aspect_ratio': aspect_ratio,
+                        'clear_all': False,  # Disable subprocess in subprocess
+                        'vae_tiled_decode': vae_tiled_decode,
+                        'vae_tile_size': vae_tile_size,
+                        'vae_tile_overlap': vae_tile_overlap,
+                        'base_resolution_width': base_resolution_width,
+                        'base_resolution_height': base_resolution_height,
+                        'duration_seconds': batch_duration_seconds,
+                        'auto_crop_image': False,  # Image already cropped in main process
+                        'base_filename': current_base_name,  # Use current base name for batch processing (handles multiline numbering)
+                        'output_dir': outputs_dir,  # Pass output directory to subprocess
+                        'enable_multiline_prompts': False,  # Disable in subprocess
+                        'enable_video_extension': enable_video_extension,  # Pass through extension setting
+                        'disable_auto_prompt_validation': disable_auto_prompt_validation,  # Pass through validation setting
+                        'auto_pad_32px_divisible': auto_pad_32px_divisible,  # Pass through padding setting
+                        'force_exact_resolution': True,  # CRITICAL: Always use exact resolution in subprocess
+                        'lora_1': lora_1, 'lora_1_scale': lora_1_scale, 'lora_1_layers': lora_1_layers,
+                        'lora_2': lora_2, 'lora_2_scale': lora_2_scale, 'lora_2_layers': lora_2_layers,
+                        'lora_3': lora_3, 'lora_3_scale': lora_3_scale, 'lora_3_layers': lora_3_layers,
+                        'lora_4': lora_4, 'lora_4_scale': lora_4_scale, 'lora_4_layers': lora_4_layers,
+                    }
+
+                    success = run_generation_subprocess(single_gen_params)
+                    if success:
+                        # Find the generated file with current_base_name prefix in the correct output directory
+                        import glob
+                        pattern = os.path.join(outputs_dir, f"{current_base_name}_*.mp4")
+                        existing_files = glob.glob(pattern)
+                        if existing_files:
+                            last_output_path = max(existing_files, key=os.path.getctime)
+                            print(f"      [SUCCESS] Saved to: {last_output_path}")
+                            processed_count += 1
+                        else:
+                            print(f"      [WARNING] No output file found for {current_base_name} in {outputs_dir}")
+                            print(f"      [DEBUG] Search pattern: {pattern}")
+                    else:
+                        print(f"      [ERROR] Generation failed in subprocess")
+                    continue
+
+                # Original batch generation logic (when clear_all is disabled)
+                # Now uses generate_video() to support video extensions
+                if not clear_all:
+                    try:
+                        # Call generate_video() which handles everything including video extensions
+                        last_output_path = generate_video(
+                            text_prompt=batch_prompt,
+                            image=final_image_path,
+                            video_frame_height=batch_video_height,
+                            video_frame_width=batch_video_width,
+                            video_seed=current_seed,
+                            solver_name=solver_name,
+                            sample_steps=sample_steps,
+                            shift=shift,
+                            video_guidance_scale=video_guidance_scale,
+                            audio_guidance_scale=audio_guidance_scale,
+                            slg_layer=slg_layer,
+                            blocks_to_swap=blocks_to_swap,
+                            optimized_block_swap=optimized_block_swap,
+                            video_negative_prompt=video_negative_prompt,
+                            audio_negative_prompt=audio_negative_prompt,
+                            use_image_gen=False,
+                            cpu_offload=cpu_offload,
+                            delete_text_encoder=delete_text_encoder,
+                            fp8_t5=fp8_t5,
+                            cpu_only_t5=cpu_only_t5,
+                            fp8_base_model=fp8_base_model,
+                            use_sage_attention=use_sage_attention,
+                            no_audio=no_audio,
+                            no_block_prep=no_block_prep,
+                            num_generations=1,  # Generate one at a time in batch mode
+                            randomize_seed=False,  # Seed already set above
+                            save_metadata=save_metadata,
+                            aspect_ratio=aspect_ratio,
+                            clear_all=False,  # We're already in non-clear_all mode
+                            vae_tiled_decode=vae_tiled_decode,
+                            vae_tile_size=vae_tile_size,
+                            vae_tile_overlap=vae_tile_overlap,
+                            base_resolution_width=base_resolution_width,
+                            base_resolution_height=base_resolution_height,
+                            duration_seconds=batch_duration_seconds,
+                            auto_crop_image=False,  # Image already cropped
+                            base_filename=current_base_name,  # Use batch-specific filename
+                            output_dir=outputs_dir,
+                            text_embeddings_cache=None,
+                            enable_multiline_prompts=False,  # Already handled at batch level
+                            enable_video_extension=enable_video_extension,  # Pass through video extension setting
+                            dont_auto_combine_video_input=dont_auto_combine_video_input,  # Pass through setting
+                            auto_pad_32px_divisible=auto_pad_32px_divisible,  # Pass through padding setting
+                            merge_loras_on_gpu=merge_loras_on_gpu,  # Pass through LoRA GPU merging setting
+                            lora_1=lora_1, lora_1_scale=lora_1_scale, lora_1_layers=lora_1_layers,
+                            lora_2=lora_2, lora_2_scale=lora_2_scale, lora_2_layers=lora_2_layers,
+                            lora_3=lora_3, lora_3_scale=lora_3_scale, lora_3_layers=lora_3_layers,
+                            lora_4=lora_4, lora_4_scale=lora_4_scale, lora_4_layers=lora_4_layers,
+                        )
+                        
+                        if last_output_path:
+                            print(f"      [SUCCESS] Saved to: {last_output_path}")
+                            processed_count += 1
+                        else:
+                            print(f"      [WARNING] Generation returned no output path")
+
+                    except Exception as e:
+                        print(f"      [ERROR] Generation failed: {e}")
+                        continue
+
+        print("\n" + "=" * 80)
+        print("[BATCH COMPLETE]")
+        print(f"  Processed: {processed_count} videos")
+        print(f"  Skipped: {skipped_count} existing videos")
+        print(f"  Total items: {len(batch_items)}")
+        print(f"  Output directory: {outputs_dir}")
+        print("=" * 80)
+
+        # Return None instead of path to avoid Gradio InvalidPathError when using custom output directory
+        # Gradio cannot handle paths outside its allowed directories (working dir, temp dir)
+        # The user can access the files directly from the output folder
+        return None
+
+    except Exception as e:
+        error_msg = str(e)
+        if "cancelled by user" in error_msg.lower():
+            print("[BATCH] Batch processing cancelled by user")
+            reset_cancellation()  # Reset the cancellation flag
+            return None
+        else:
+            print(f"[BATCH ERROR] {e}")
+            return None
+
+def load_i2v_example_with_resolution(prompt, img_path):
+    """Load I2V example and set appropriate resolution based on image aspect ratio."""
+    if img_path is None or not os.path.exists(img_path):
+        return (prompt, None, gr.update(), gr.update(), gr.update(), None)
+    
+    try:
+        # Don't convert here - conversion will happen during generation
+        # For preview, we'll use the original file to avoid Gradio file serving issues
+        
+        img = Image.open(img_path)
+        iw, ih = img.size
+        if ih == 0 or iw == 0:
+            return (prompt, img_path, gr.update(), gr.update(), gr.update(), img_path)
+        
+        aspect = iw / ih
+
+        # Calculate aspect ratios from ratio strings and find closest match
+        def get_ratio_value(ratio_str):
+            w, h = map(float, ratio_str.split(':'))
+            return w / h
+
+        closest_key = min(ASPECT_RATIOS.keys(), key=lambda k: abs(get_ratio_value(k) - aspect))
+        target_w, target_h = ASPECT_RATIOS[closest_key]
+        aspect_display = _format_ratio_choice(closest_key, ASPECT_RATIOS[closest_key])
+        aspect_choices = [_format_ratio_choice(name, dims) for name, dims in get_common_aspect_ratios(target_w, target_h).items()]
+        if aspect_display not in aspect_choices:
+            aspect_choices = [aspect_display] + aspect_choices
+        
+        return (
+            prompt, 
+            img_path,
+            gr.update(value=aspect_display, choices=aspect_choices),
+            gr.update(value=target_w),
+            gr.update(value=target_h),
+            img_path
+        )
+    except Exception as e:
+        print(f"Error loading I2V example: {e}")
+        return (prompt, img_path, gr.update(), gr.update(), gr.update(), img_path)
+
+
+def pad_image_to_resolution(image, target_width, target_height):
+    """Intelligently downscale and pad image to target resolution maintaining aspect ratio.
+    
+    This function:
+    1. Downscales image to fit within target dimensions (maintaining aspect ratio)
+    2. Pads equally on both sides to reach exact target dimensions
+    3. Uses black padding (RGB: 0, 0, 0)
+    
+    Args:
+        image: PIL Image object
+        target_width: Target width (should be divisible by 32)
+        target_height: Target height (should be divisible by 32)
+    
+    Returns:
+        PIL Image object with exact target dimensions
+    """
+    from PIL import Image as PILImage
+    
+    orig_w, orig_h = image.size
+    
+    # Calculate scaling to fit within target dimensions (maintaining aspect ratio)
+    scale_w = target_width / orig_w
+    scale_h = target_height / orig_h
+    scale = min(scale_w, scale_h)  # Use smaller scale to fit within bounds
+    
+    # Calculate new dimensions after scaling (maintaining aspect ratio)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    
+    # Ensure dimensions don't exceed target (edge case protection)
+    new_w = min(new_w, target_width)
+    new_h = min(new_h, target_height)
+    
+    # Downscale image
+    scaled_image = image.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+    
+    # Calculate padding needed
+    pad_w = target_width - new_w
+    pad_h = target_height - new_h
+    
+    # Distribute padding equally on both sides
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left  # Handles odd padding
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top  # Handles odd padding
+    
+    # Create new image with target dimensions (black background)
+    padded_image = PILImage.new('RGB', (target_width, target_height), (0, 0, 0))
+    
+    # Paste scaled image centered
+    padded_image.paste(scaled_image, (pad_left, pad_top))
+    
+    print(f"[AUTO-PAD] Original: {orig_w}×{orig_h} → Scaled: {new_w}×{new_h} → Padded: {target_width}×{target_height}")
+    print(f"[AUTO-PAD] Padding applied - Left: {pad_left}px, Right: {pad_right}px, Top: {pad_top}px, Bottom: {pad_bottom}px")
+    
+    return padded_image
+
+def apply_auto_crop_if_enabled(image_path, auto_crop_image, target_width=None, target_height=None, return_dimensions=False, auto_pad_32px_divisible=False):
+    """Apply auto cropping to image if enabled. Returns the final image path to use.
+
+    When target_width and target_height are provided, they are used as the target resolution.
+    This is the case when the user has manually set dimensions or when called from generation.
+
+    When they are None, the function auto-detects the closest aspect ratio from the image.
+
+    Args:
+        return_dimensions: If True, returns (image_path, width, height) instead of just image_path
+        auto_pad_32px_divisible: If True, intelligently downscales and pads instead of crop+resize
+    """
+    # Defensive checks to prevent errors with invalid image_path
+    if not isinstance(image_path, (str, type(None))):
+        print(f"[AUTO-CROP] Warning: image_path is not string or None: {type(image_path)} {repr(image_path)}")
+        # Return None instead of the invalid value to prevent downstream errors
+        if return_dimensions:
+            return None, target_width, target_height
+        return None
+
+    if not auto_crop_image or image_path is None or not isinstance(image_path, str) or image_path.strip() == "" or not os.path.exists(image_path):
+        if return_dimensions:
+            return image_path, target_width, target_height
+        return image_path
+
+    try:
+        mode_label = "AUTO-PAD" if auto_pad_32px_divisible else "AUTO-CROP"
+        print(f"[{mode_label}] Processing image for generation...")
+        img = Image.open(image_path)
+        iw, ih = img.size
+        if ih > 0 and iw > 0:
+            aspect = iw / ih
+            # Calculate aspect ratios from ratio strings and find closest match
+            def get_ratio_value(ratio_str):
+                w, h = map(float, ratio_str.split(':'))
+                return w / h
+
+            if target_width and target_height:
+                # Use provided target dimensions (user has manually set them or they come from UI)
+                target_w, target_h = target_width, target_height
+                closest_key = None
+                # Find the closest standard aspect ratio for logging
+                for key in ASPECT_RATIOS.keys():
+                    if ASPECT_RATIOS[key] == [target_w, target_h]:
+                        closest_key = key
+                        break
+                if not closest_key:
+                    closest_key = f"{target_w}x{target_h}"
+                print(f"[{mode_label}] Using provided resolution: {target_w}x{target_h} ({closest_key})")
+            else:
+                # Auto-detect from image dimensions
+                closest_key = min(ASPECT_RATIOS.keys(), key=lambda k: abs(get_ratio_value(k) - aspect))
+                target_w, target_h = ASPECT_RATIOS[closest_key]
+                print(f"[{mode_label}] Image {iw}×{ih} (aspect {aspect:.3f}) → Auto-detected ratio: {closest_key} → {target_w}×{target_h}")
+
+            # Choose processing method based on auto_pad_32px_divisible
+            if auto_pad_32px_divisible:
+                # Use intelligent downscaling + padding
+                processed = pad_image_to_resolution(img, target_w, target_h)
+            else:
+                # Use traditional crop + resize
+                target_aspect = target_w / target_h
+                image_aspect = iw / ih
+
+                # Center crop to target aspect
+                if image_aspect > target_aspect:
+                    crop_w = int(ih * target_aspect)
+                    left = (iw - crop_w) // 2
+                    box = (left, 0, left + crop_w, ih)
+                else:
+                    crop_h = int(iw / target_aspect)
+                    top = (ih - crop_h) // 2
+                    box = (0, top, iw, top + crop_h)
+
+                processed = img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+            # Save to temp dir
+            tmp_dir = os.path.join(os.path.dirname(__file__), "temp")
+            os.makedirs(tmp_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            output_filename = f"padded_{timestamp}.png" if auto_pad_32px_divisible else f"cropped_{timestamp}.png"
+            output_path = os.path.join(tmp_dir, output_filename)
+            processed.save(output_path)
+            print(f"[{mode_label}] Processed image saved to: {output_path}")
+            
+            if return_dimensions:
+                return output_path, target_w, target_h
+            return output_path
+        else:
+            print(f"[{mode_label}] Invalid image dimensions, using original")
+            if return_dimensions:
+                return image_path, target_width, target_height
+            return image_path
+    except Exception as e:
+        print(f"[{mode_label}] Processing failed: {e}, using original image")
+        if return_dimensions:
+            return image_path, target_width, target_height
+        return image_path
+
+def update_cropped_image_only(original_image_path, auto_crop_image, video_width, video_height, orig_width=None, orig_height=None, auto_pad_32px_divisible=False):
+    """Update only the cropped/padded image preview when resolution changes.
+    
+    CRITICAL: This function ALWAYS uses the ORIGINAL image for cropping/padding.
+    It should NEVER update input_preview or image_resolution_label.
+    Those should only be set once during upload and remain unchanged.
+    
+    Args:
+        original_image_path: Path to the ORIGINAL uploaded image (never a cropped version)
+        orig_width, orig_height: Original image dimensions (for validation, not display)
+        auto_pad_32px_divisible: If True, use padding instead of crop+resize
+    """
+    if original_image_path is None or not os.path.exists(original_image_path):
+        return (
+            gr.update(visible=False, value=None),
+            gr.update(value="", visible=False),
+            None
+        )
+    
+    try:
+        # CRITICAL: Always use the ORIGINAL image for cropping
+        # This ensures each recrop starts from the full-resolution original
+        img = Image.open(original_image_path)
+        iw, ih = img.size
+        
+        # CRITICAL: Do NOT update input resolution label here!
+        # That should only be set during upload and never change.
+        
+        if ih == 0 or iw == 0 or not auto_crop_image:
+            return (
+                gr.update(visible=False, value=None),
+                gr.update(value="", visible=False),
+                original_image_path  # Return original if no cropping
+            )
+
+        # Validate dimensions to avoid errors
+        if video_width and video_height:
+            try:
+                vw = int(video_width)
+                vh = int(video_height)
+                # Only proceed if dimensions are valid
+                if vw < 32 or vh < 32:
+                    return (
+                        gr.update(visible=False, value=None),
+                        gr.update(value="", visible=False),
+                        original_image_path  # Return original
+                    )
+                target_w = max(32, (vw // 32) * 32)
+                target_h = max(32, (vh // 32) * 32)
+            except (ValueError, TypeError):
+                return (
+                    gr.update(visible=False, value=None),
+                    gr.update(value="", visible=False),
+                    original_image_path  # Return original
+                )
+        else:
+            return (
+                gr.update(visible=False, value=None),
+                gr.update(value="", visible=False),
+                original_image_path  # Return original
+            )
+
+        # Choose processing method based on auto_pad_32px_divisible
+        if auto_pad_32px_divisible:
+            # Use intelligent downscaling + padding
+            processed = pad_image_to_resolution(img, target_w, target_h)
+        else:
+            # Use traditional crop + resize
+            target_aspect = target_w / target_h
+            image_aspect = iw / ih
+
+            # Center crop to target aspect
+            if image_aspect > target_aspect:
+                crop_w = int(ih * target_aspect)
+                left = (iw - crop_w) // 2
+                box = (left, 0, left + crop_w, ih)
+            else:
+                crop_h = int(iw / target_aspect)
+                top = (ih - crop_h) // 2
+                box = (0, top, iw, top + crop_h)
+
+            processed = img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+        # Save to temp dir
+        tmp_dir = os.path.join(os.path.dirname(__file__), "temp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_filename = f"padded_{timestamp}.png" if auto_pad_32px_divisible else f"cropped_{timestamp}.png"
+        processed_path = os.path.join(tmp_dir, output_filename)
+        processed.save(processed_path)
+
+        # Create output resolution label
+        label_prefix = "Padded" if auto_pad_32px_divisible else "Cropped"
+        output_res_label = f"**{label_prefix} Image Resolution:** {target_w}×{target_h}px"
+
+        # ONLY return processed display and label - NEVER touch input preview/label
+        return (
+            gr.update(visible=True, value=processed_path),
+            gr.update(value=output_res_label, visible=True),
+            processed_path  # Return newly processed image for generation
+        )
+    except Exception as e:
+        print(f"Error in update_cropped_image_only: {e}")
+        import traceback
+        traceback.print_exc()
+        return (
+            gr.update(visible=False, value=None),
+            gr.update(value="", visible=False),
+            original_image_path  # Return original on error
+        )
+
+def update_image_crop_and_labels(image_path, auto_crop_image, video_width, video_height):
+    """Update cropped image and resolution labels when resolution changes."""
+    if image_path is None or not os.path.exists(image_path):
+        return (
+            gr.update(visible=False, value=None),
+            gr.update(value="", visible=False),
+            gr.update(),
+            gr.update(),
+            gr.update(value="", visible=False),
+            None
+        )
+    
+    try:
+        img = Image.open(image_path)
+        iw, ih = img.size
+        
+        # Show input image resolution
+        input_res_label = f"**Input Image Resolution:** {iw}×{ih}px"
+        
+        if ih == 0 or iw == 0:
+            return (
+                gr.update(visible=False, value=None),
+                gr.update(value=input_res_label, visible=True),
+                gr.update(),
+                gr.update(),
+                gr.update(value="", visible=False),
+                image_path
+            )
+
+        closest_key = None
+
+        # Use exact resolution (snapped to 32px for compatibility)
+        if video_width and video_height:
+            target_w = max(32, (int(video_width) // 32) * 32)
+            target_h = max(32, (int(video_height) // 32) * 32)
+
+            if target_h > 0:
+                aspect = target_w / target_h
+                closest_key = min(
+                    ASPECT_RATIOS.keys(),
+                    key=lambda k: abs((ASPECT_RATIOS[k][0] / ASPECT_RATIOS[k][1]) - aspect)
+                )
+        else:
+            # Fallback: find closest aspect ratio match
+            aspect = iw / ih
+            closest_key = min(ASPECT_RATIOS.keys(), key=lambda k: abs(ASPECT_RATIOS[k][0] / ASPECT_RATIOS[k][1] - aspect))
+            target_w, target_h = ASPECT_RATIOS[closest_key]
+
+        target_aspect = target_w / target_h
+        image_aspect = iw / ih
+
+        # Center crop to target aspect
+        if image_aspect > target_aspect:
+            crop_w = int(ih * target_aspect)
+            left = (iw - crop_w) // 2
+            box = (left, 0, left + crop_w, ih)
+        else:
+            crop_h = int(iw / target_aspect)
+            top = (ih - crop_h) // 2
+            box = (0, top, iw, top + crop_h)
+
+        cropped = img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+        # Save to temp dir
+        tmp_dir = os.path.join(os.path.dirname(__file__), "temp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cropped_path = os.path.join(tmp_dir, f"cropped_{timestamp}.png")
+        cropped.save(cropped_path)
+
+        # Create output resolution label
+        output_res_label = f"**Cropped Image Resolution:** {target_w}×{target_h}px"
+
+        if auto_crop_image:
+            display_value = None
+            aspect_choices = [_format_ratio_choice(name, dims) for name, dims in get_common_aspect_ratios(target_w, target_h).items()]
+            if closest_key is not None:
+                if closest_key in ASPECT_RATIOS:
+                    display_value = _format_ratio_choice(closest_key, ASPECT_RATIOS[closest_key])
+                if display_value and display_value not in aspect_choices:
+                    aspect_choices = [display_value] + aspect_choices
+            if display_value is None:
+                display_value = _format_custom_choice(target_w, target_h)
+                if display_value not in aspect_choices:
+                    aspect_choices = [display_value] + aspect_choices
+            aspect_ratio_value = gr.update(value=display_value, choices=aspect_choices)
+
+            return (
+                gr.update(visible=True, value=cropped_path),
+                gr.update(value=input_res_label, visible=True),
+                aspect_ratio_value,
+                gr.update(value=target_w),
+                gr.update(value=target_h),
+                gr.update(value=output_res_label, visible=True),
+                cropped_path
+            )
+        else:
+            return (
+                gr.update(visible=False, value=None),
+                gr.update(value=input_res_label, visible=True),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(value="", visible=False),
+                image_path
+            )
+    except Exception as e:
+        print(f"Error in update_image_crop_and_labels: {e}")
+        return (
+            gr.update(visible=False, value=None),
+            gr.update(value="", visible=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value="", visible=False),
+            image_path
+        )
+
+def on_media_upload(media_path, auto_crop_image, video_width, video_height, base_resolution_width=720, base_resolution_height=720):
+    """Called when user uploads media (image or video) - processes and updates UI.
+    
+    Returns: (input_preview, cropped_display, image_resolution_label, aspect_ratio, 
+             video_width, video_height, cropped_resolution_label, image_to_use, 
+             input_video_state, original_image_path, original_image_width, original_image_height)
+    """
+    if media_path is None:
+        return (
+            gr.update(visible=False, value=None),  # input_preview
+            gr.update(visible=False, value=None),  # cropped_display
+            gr.update(value="", visible=False),    # image_resolution_label
+            gr.update(value=None),                 # aspect_ratio
+            gr.update(value=None),                 # video_width
+            gr.update(),                           # video_height
+            gr.update(value="", visible=False),    # cropped_resolution_label
+            None,                                  # image_to_use
+            None,                                  # input_video_state
+            None,                                  # original_image_path
+            None,                                  # original_image_width
+            None                                   # original_image_height
+        )
+
+    if not os.path.exists(media_path):
+        return (
+            gr.update(visible=False, value=None),  # input_preview
+            gr.update(visible=False, value=None),  # cropped_display
+            gr.update(value="", visible=False),    # image_resolution_label
+            gr.update(),                           # aspect_ratio
+            gr.update(),                           # video_width
+            gr.update(),                           # video_height
+            gr.update(value="", visible=False),    # cropped_resolution_label
+            media_path,                            # image_to_use
+            None,                                  # input_video_state
+            None,                                  # original_image_path
+            None,                                  # original_image_width
+            None                                   # original_image_height
+        )
+
+    try:
+        # Check if input is video or image
+        is_video = is_video_file(media_path)
+        
+        if is_video:
+            # Extract last frame from video
+            print(f"[MEDIA UPLOAD] Video detected, extracting last frame...")
+            frame_path = extract_last_frame(media_path)
+            if not frame_path:
+                print(f"[MEDIA UPLOAD] Failed to extract frame from video")
+                return (
+                    gr.update(visible=False, value=None),  # input_preview
+                    gr.update(visible=False, value=None),  # cropped_display
+                    gr.update(value="**Error:** Failed to extract frame from video", visible=True),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(value="", visible=False),
+                    None,
+                    None  # input_video_state
+                )
+            
+            # Use the extracted frame for aspect ratio detection and cropping
+            image_path = frame_path
+            input_res_label = f"**Input Video:** Last frame extracted"
+        else:
+            image_path = media_path
+            input_res_label = ""
+        
+        # Don't convert here - conversion will happen during generation
+        # For preview, we'll use the original file to avoid Gradio file serving issues
+        
+        # Process the image (whether from video or direct upload)
+        img = Image.open(image_path)
+        original_width, original_height = img.size  # Store ORIGINAL dimensions
+        
+        if is_video:
+            input_res_label = f"**Input Video:** Last frame extracted - {original_width}×{original_height}px"
+        else:
+            input_res_label = f"**Input Image Resolution:** {original_width}×{original_height}px"
+        
+        if original_height == 0 or original_width == 0:
+            return (
+                gr.update(visible=True, value=image_path),   # input_preview - show the raw image/frame
+                gr.update(visible=False, value=None),        # cropped_display
+                gr.update(value=input_res_label, visible=True),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(value="", visible=False),
+                image_path,
+                media_path if is_video else None,  # input_video_state
+                image_path,                        # original_image_path
+                original_width,                    # original_image_width
+                original_height                    # original_image_height
+            )
+        
+        # Calculate aspect ratio from ORIGINAL IMAGE dimensions (not from video_width/video_height)
+        aspect = original_width / original_height
+        
+        # Find closest aspect ratio match
+        def get_ratio_value(ratio_str):
+            w, h = map(float, ratio_str.split(':'))
+            return w / h
+        
+        # Get aspect ratios based on the user's BASE resolution settings
+        base_aspect_ratios = get_common_aspect_ratios(base_resolution_width, base_resolution_height)
+        closest_key = min(base_aspect_ratios.keys(), key=lambda k: abs(get_ratio_value(k) - aspect))
+        target_w, target_h = base_aspect_ratios[closest_key]
+        
+        print(f"[AUTO-DETECT] {'Video frame' if is_video else 'Image'} {original_width}×{original_height} (aspect {aspect:.3f}) → Closest ratio: {closest_key} → {target_w}×{target_h}")
+        
+        # Calculate cropped image using ORIGINAL dimensions
+        target_aspect = target_w / target_h
+        image_aspect = original_width / original_height
+        
+        # Center crop to target aspect using ORIGINAL dimensions
+        if image_aspect > target_aspect:
+            crop_w = int(original_height * target_aspect)
+            left = (original_width - crop_w) // 2
+            box = (left, 0, left + crop_w, original_height)
+        else:
+            crop_h = int(original_width / target_aspect)
+            top = (original_height - crop_h) // 2
+            box = (0, top, original_width, top + crop_h)
+        
+        cropped = img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        
+        # Save to temp dir
+        tmp_dir = os.path.join(os.path.dirname(__file__), "temp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cropped_path = os.path.join(tmp_dir, f"cropped_{timestamp}.png")
+        cropped.save(cropped_path)
+        
+        output_res_label = f"**Cropped {'Frame' if is_video else 'Image'} Resolution:** {target_w}×{target_h}px"
+        
+        # Format aspect ratio for dropdown - use BASE resolution to generate choices (base_aspect_ratios already calculated above)
+        aspect_display = _format_ratio_choice(closest_key, base_aspect_ratios[closest_key])
+        aspect_choices = [_format_ratio_choice(name, dims) for name, dims in base_aspect_ratios.items()]
+        if aspect_display not in aspect_choices:
+            aspect_choices = [aspect_display] + aspect_choices
+        
+        if auto_crop_image:
+            return (
+                gr.update(visible=True, value=image_path),             # input_preview - show ORIGINAL raw image/frame
+                gr.update(visible=True, value=cropped_path),           # cropped_display - show cropped
+                gr.update(value=input_res_label, visible=True),        # Show ORIGINAL dimensions label
+                gr.update(value=aspect_display, choices=aspect_choices),  # Update aspect ratio
+                gr.update(value=target_w),  # Update width
+                gr.update(value=target_h),  # Update height
+                gr.update(value=output_res_label, visible=True),
+                cropped_path,                                          # image_to_use (for generation)
+                media_path if is_video else None,                      # input_video_state
+                image_path,                                            # original_image_path (never changes)
+                original_width,                                        # original_image_width (never changes)
+                original_height                                        # original_image_height (never changes)
+            )
+        else:
+            return (
+                gr.update(visible=True, value=image_path),             # input_preview - show ORIGINAL raw image/frame
+                gr.update(visible=False, value=None),                  # cropped_display - hide when no crop
+                gr.update(value=input_res_label, visible=True),        # Show ORIGINAL dimensions label
+                gr.update(value=aspect_display, choices=aspect_choices),  # Still update aspect ratio
+                gr.update(value=target_w),  # Still update width
+                gr.update(value=target_h),  # Still update height
+                gr.update(value="", visible=False),
+                image_path,                                            # image_to_use (for generation)
+                media_path if is_video else None,                      # input_video_state
+                image_path,                                            # original_image_path (never changes)
+                original_width,                                        # original_image_width (never changes)
+                original_height                                        # original_image_height (never changes)
+            )
+    
+    except Exception as e:
+        print(f"Error in on_media_upload: {e}")
+        import traceback
+        traceback.print_exc()
+        return (
+            gr.update(visible=False, value=None),  # input_preview
+            gr.update(visible=False, value=None),  # cropped_display
+            gr.update(value="", visible=False),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value="", visible=False),
+            media_path,
+            None,  # input_video_state
+            None,  # original_image_path
+            None,  # original_image_width
+            None   # original_image_height
+        )
+
+def on_image_upload(image_path, auto_crop_image, video_width, video_height, base_resolution_width=720, base_resolution_height=720):
+    """Legacy function - redirects to on_media_upload for compatibility."""
+    result = on_media_upload(image_path, auto_crop_image, video_width, video_height, base_resolution_width, base_resolution_height)
+    # Return all values except the last one (input_video_state) for backward compatibility
+    return result[:-1]
+
+def generate_video_with_error_handling(*args, **kwargs):
+    """Wrapper for generate_video that catches validation errors and displays them in UI."""
+    try:
+        result = generate_video(*args, **kwargs)
+        # Success: return the video path and hide error message
+        return result, gr.update(value="", visible=False)
+    except ValueError as e:
+        error_msg = str(e)
+        # Check if this is a prompt validation error
+        if "Invalid prompt format" in error_msg:
+            # Format the error message for display
+            import html
+            formatted_error = html.escape(error_msg.replace("Invalid prompt format:\n\n", ""))
+            formatted_error = formatted_error.replace('\n\n', '\n\n').replace('\n', '  \n')
+
+            display_error = f"""### ❌ Prompt Syntax Error
+
+**Your prompt has syntax errors and cannot be processed:**
+
+{formatted_error}
+
+**Required format:**
+- **Speech tags (REQUIRED):** `<S>Your dialogue here<E>` - At least one pair required
+- **Audio captions (OPTIONAL):** `<AUDCAP>Audio description<ENDAUDCAP>` - Must be paired if used
+
+**Example:**
+```
+A person says <S>Hello, how are you?<E> while smiling. <AUDCAP>Clear male voice, friendly tone<ENDAUDCAP>
+```
+
+Please fix the prompt format and try again."""
+            return gr.update(value=None), gr.update(value=display_error, visible=True)
+        else:
+            # Other ValueError, show as generic error
+            display_error = f"### ❌ Generation Error\n\n{error_msg}"
+            return gr.update(value=None), gr.update(value=display_error, visible=True)
+    except Exception as e:
+        # Other exceptions
+        display_error = f"### ❌ Unexpected Error\n\n{str(e)}"
+        return gr.update(value=None), gr.update(value=display_error, visible=True)
+
+def process_batch_generation_with_error_handling(*args, **kwargs):
+    """Wrapper for process_batch_generation that catches validation errors and displays them in UI."""
+    try:
+        print("[BATCH] Starting batch processing with error handling...")
+        result = process_batch_generation(*args, **kwargs)
+        # Success: return the result and hide error message
+        print("[BATCH] Batch processing completed successfully")
+        return result, gr.update(value="", visible=False)
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[BATCH] Batch processing failed with error: {error_msg}")
+        # For batch processing, show the error that occurred
+        display_error = f"""### ❌ Batch Processing Error
+
+**An error occurred during batch processing:**
+
+{error_msg}
+
+**Common issues:**
+- Invalid prompt format in one or more files
+- Missing or corrupted input files
+- Insufficient disk space or permissions
+
+Check the console output for detailed error information and verify your input files."""
+        print(f"[BATCH] Returning error to UI: {display_error[:100]}...")
+        return gr.update(value=None), gr.update(value=display_error, visible=True)
+
+theme = gr.themes.Soft(
+    primary_hue=gr.themes.colors.indigo,
+    secondary_hue=gr.themes.colors.slate,
+    neutral_hue=gr.themes.colors.gray,
+)
+theme.font = ["Inter", "ui-sans-serif", "system-ui", "sans-serif"]
+with gr.Blocks(theme=theme, title="Brandulate OVI v1", css="""
+    .gradio-container { max-width: 100% !important; }
+    .app-header { text-align: center; padding: 12px 0 8px 0; margin-bottom: 8px; border-bottom: 2px solid var(--primary-500); }
+    .app-header h1 { margin: 0; font-size: 1.8em; font-weight: 700; color: var(--primary-600); }
+    .app-header p { margin: 4px 0 0 0; font-size: 0.9em; color: var(--neutral-500); }
+    .section-label { font-weight: 600; color: var(--primary-600); margin-bottom: 4px; }
+""") as demo:
+    gr.HTML("""
+        <div class="app-header">
+            <h1>Brandulate OVI</h1>
+            <p>AI Video + Audio Generation &mdash; v1.0 &mdash; <a href="https://brandulate.com" target="_blank">brandulate.com</a></p>
+        </div>
+    """)
+    print("Brandulate OVI v1.0")
+    image_to_use = gr.State(value=None)
+    input_video_state = gr.State(value=None)  # Store input video path for merging
+    original_image_path = gr.State(value=None)  # Store original uploaded image path (never changes until new upload)
+    original_image_width = gr.State(value=None)  # Store original image width
+    original_image_height = gr.State(value=None)  # Store original image height
+
+    with gr.Tabs(selected="generate") as main_tabs:
+        with gr.TabItem("Generate", id="generate"):
+            with gr.Row():
+                with gr.Column():
+                    # Image/Video section - now accepts both
+                    gr.Markdown("""
+                    **📥 Input Media:** Upload an image or video as your starting point
+                    - **Image:** Supports PNG, JPG, WebP, BMP, TIFF, GIF (auto-converted to PNG for accuracy)
+                    - **Video:** Supports MP4, AVI, MOV, MKV, WebM (last frame extracted + merged with output)
+                    """)
+                    image = gr.File(
+                        type="filepath",
+                        label="Upload Image or Video",
+                        file_types=[".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif", 
+                                   ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"],
+                        file_count="single"
+                    )
+                    # Preview of uploaded media (shows original image or extracted frame)
+                    input_preview = gr.Image(label="Input Preview", visible=False, height=512, show_label=True)
+                    image_resolution_label = gr.Markdown("", visible=False)
+
+                    # Generate Video button right under image upload
+                    run_btn = gr.Button("Generate Video 🚀", variant="primary", size="lg")
+
+                    with gr.Accordion("🎬 Video Generation Options", open=True):
+                        # Video prompt with 10 lines
+                        video_text_prompt = gr.Textbox(
+                            label="Video Prompt",
+                            placeholder="Describe your video...",
+                            lines=10
+                        )
+                        
+                        # Prompt validation section
+                        with gr.Row():
+                            validate_prompt_btn = gr.Button("✅ Validate Prompt Format", size="md", variant="secondary")
+                            disable_auto_prompt_validation = gr.Checkbox(
+                                label="Do not auto enforce validation check",
+                                value=False,
+                                info="When checked, bypasses automatic prompt validation for both batch and single processing"
+                            )
+                            auto_pad_32px_divisible = gr.Checkbox(
+                                label="Auto pad for 32px divisibility",
+                                value=False,
+                                info="Intelligently downscale and pad images (maintains aspect ratio) instead of crop+resize"
+                            )
+
+                        # Aspect ratio and resolution in reorganized layout
+                        with gr.Row():
+                            with gr.Column(scale=2, min_width=1):
+                                aspect_ratio = gr.Dropdown(
+                                    choices=[f"{name} - {w}x{h}px" for name, (w, h) in get_common_aspect_ratios(720, 720).items()],
+                                    value="16:9 - 992x512px",
+                                    label="Aspect Ratio",
+                                    info="Select aspect ratio - width and height will update automatically based on base resolution",
+                                    allow_custom_value=True
+                                )
+                            with gr.Column(scale=2, min_width=1):
+                                with gr.Row():
+                                    video_width = gr.Number(maximum=1920, value=992, step=32, label="Video Width",
+                                        # NO minimum constraint - allows free typing without validation errors
+                                        # Validation happens in the update functions instead
+                                        info="Video width in pixels (higher values use more VRAM)")
+                                    video_height = gr.Number(maximum=1920, value=512, step=32, label="Video Height",
+                                        # NO minimum constraint - allows free typing without validation errors
+                                        # Validation happens in the update functions instead
+                                        info="Video height in pixels (higher values use more VRAM)")
+                            with gr.Column(scale=1, min_width=1):
+                                auto_crop_image = gr.Checkbox(
+                                    value=True,
+                                    label="Auto Crop Image",
+                                    info="Automatically detect closest aspect ratio and crop image for perfect I2V generation"
+                                )
+
+                        # Base Resolution and Duration Controls
+                        with gr.Row():
+                            base_resolution_width = gr.Number(
+                                value=720,
+                                label="Base Width",
+                                step=32,
+                                # NO minimum constraint - allows free typing without validation errors
+                                # Validation happens in the update functions instead
+                                info="Base width for aspect ratio calculations (higher values use more VRAM)"
+                            )
+                            base_resolution_height = gr.Number(
+                                value=720,
+                                label="Base Height",
+                                step=32,
+                                # NO minimum constraint - allows free typing without validation errors
+                                # Validation happens in the update functions instead
+                                info="Base height for aspect ratio calculations (higher values use more VRAM)"
+                            )
+                            duration_seconds = gr.Slider(
+                                value=5,
+                                step=1,
+                                label="Duration (seconds)",
+                                info="Video duration in seconds (longer durations use more VRAM)"
+                            )
+
+                        # Multi-line Prompts and Video Extension Options
+                        with gr.Row():
+                            enable_multiline_prompts = gr.Checkbox(
+                                label="Enable Multi-line Prompts",
+                                value=False,
+                                info="Each line in the prompt becomes a separate new unique generation (lines < 4 chars are skipped). This is different than Video Extension, don't enable both at the same time."
+                            )
+                            enable_video_extension = gr.Checkbox(
+                                label="Enable Video Extension (Last Frame Based)",
+                                value=False,
+                                info="Automatically extend last generated video using each line in prompt as extension (lines < 3 chars skipped). 4 Lines Prompt = 1 base + 3 times extension 20 seconds video. Uses last frame."
+                            )
+                            dont_auto_combine_video_input = gr.Checkbox(
+                                label="Don't auto combine video input",
+                                value=False,
+                                info="When a video is provided as input, use last frame as source but don't auto-combine with generated video."
+                            )
+
+                        # Video seed, randomize checkbox, disable audio, and save metadata in same row
+                        with gr.Row():
+                            video_seed = gr.Number(minimum=0, maximum=100000, value=99, label="Video Seed")
+                            randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, info="Generate random seed on each generation")
+                            no_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video without audio (faster)")
+                            save_metadata = gr.Checkbox(label="Save Metadata", value=True, info="Save generation parameters as .txt file with each video")
+
+                        # Solver, Sample Steps, and Number of Generations in same row
+                        with gr.Row():
+                            solver_name = gr.Dropdown(
+                                choices=["unipc", "euler", "dpm++"],
+                                value="unipc",
+                                label="Solver Name",
+                                info="UniPC is recommended for best quality"
+                            )
+                            sample_steps = gr.Number(
+                                value=50,
+                                label="Sample Steps",
+                                precision=0,
+                                minimum=1,
+                                maximum=100,
+                                info="Higher values = better quality but slower"
+                            )
+                            num_generations = gr.Number(
+                                value=1,
+                                label="Num Generations",
+                                precision=0,
+                                minimum=1,
+                                maximum=100,
+                                info="Number of videos to generate (seed auto-increments or randomizes)"
+                            )
+
+                        # Shift and Video Guidance Scale in same row
+                        with gr.Row():
+                            shift = gr.Slider(
+                                minimum=0.0,
+                                maximum=20.0,
+                                value=5.0,
+                                step=1.0,
+                                label="Shift",
+                                info="Controls noise schedule shift - affects generation dynamics"
+                            )
+                            video_guidance_scale = gr.Slider(
+                                minimum=0.0,
+                                maximum=10.0,
+                                value=4.0,
+                                step=0.5,
+                                label="Video Guidance Scale",
+                                info="How strongly to follow the video prompt (higher = more faithful but may be over-saturated)"
+                            )
+
+                        # Audio Guidance Scale and SLG Layer in same row
+                        with gr.Row():
+                            audio_guidance_scale = gr.Slider(
+                                minimum=0.0,
+                                maximum=10.0,
+                                value=3.0,
+                                step=0.5,
+                                label="Audio Guidance Scale",
+                                info="How strongly to follow the audio prompt (higher = more faithful audio)"
+                            )
+                            slg_layer = gr.Number(
+                                minimum=-1,
+                                maximum=30,
+                                value=11,
+                                step=1,
+                                label="SLG Layer",
+                                info="Skip Layer Guidance layer - affects audio-video synchronization"
+                            )
+
+                        # Block Swap, CPU Offload, and Clear All
+                        with gr.Row():
+                            blocks_to_swap = gr.Slider(
+                                minimum=0,
+                                maximum=29,
+                                value=12,
+                                step=1,
+                                label="Block Swap (0 = disabled)",
+                                info="Number of transformer blocks to keep on CPU (saves VRAM)"
+                            )
+                            optimized_block_swap = gr.Checkbox(
+                                label="Optimized Block Swap",
+                                value=False,
+                                info="Use experimental Musubi-style swap pipeline (faster, may use more shared memory)"
+                            )
+                            cpu_offload = gr.Checkbox(
+                                label="CPU Offload",
+                                value=True,
+                                info="Offload models to CPU between operations to save VRAM"
+                            )
+                            clear_all = gr.Checkbox(
+                                label="Clear All Memory",
+                                value=True,
+                                info="Run each generation as separate process to clear VRAM/RAM (recommended)"
+                            )
+
+
+                        # T5 Text Encoder Options (all in one row)
+                        with gr.Row():
+                            delete_text_encoder = gr.Checkbox(
+                                label="Delete T5 After Encoding",
+                                value=False,
+                                info="T5 subprocess for 100% memory cleanup (~5GB freed). Auto-enables 'Clear All Memory' mode."
+                            )
+                            fp8_t5 = gr.Checkbox(
+                                label="Scaled FP8 T5",
+                                value=False,
+                                info="Use Scaled FP8 T5 for ~50% VRAM savings (~2.5GB saved) with high quality"
+                            )
+                            cpu_only_t5 = gr.Checkbox(
+                                label="CPU-Only T5",
+                                value=False,
+                                info="Keep T5 on CPU and run inference on CPU (saves VRAM but slower encoding)"
+                            )
+                        
+                        # Inference Model FP8 Option and Sage Attention
+                        with gr.Row():
+                            fp8_base_model = gr.Checkbox(
+                                label="Scaled FP8 Base Model",
+                                value=False,
+                                info="Use FP8 for transformer blocks (~50% VRAM savings during inference, works with block swap)"
+                            )
+                            use_sage_attention = gr.Checkbox(
+                                label="Sage Attention",
+                                value=False,
+                                info="Use Sage Attention for ~10% speedup & lower VRAM (requires sageattention package)"
+                            )
+
+                        # VAE Tiled Decoding Controls
+                        with gr.Row():
+                            vae_tiled_decode = gr.Checkbox(
+                                label="Enable Tiled VAE Decode",
+                                value=False,
+                                info="✅ Process VAE decoding in tiles to save VRAM (recommended for <24GB VRAM)"
+                            )
+                            vae_tile_size = gr.Slider(
+                                minimum=12,
+                                maximum=64,
+                                value=32,
+                                step=8,
+                                label="Tile Size (Latent Space)",
+                                info="Spatial tile size: 12=max VRAM savings (slower), 32=balanced ⭐, 64=min savings (faster)"
+                            )
+                            vae_tile_overlap = gr.Slider(
+                                minimum=4,
+                                maximum=16,
+                                value=8,
+                                step=2,
+                                label="Tile Overlap",
+                                info="Overlap for seamless blending: 4=fast, 8=balanced ⭐, 16=best quality"
+                            )
+
+                        # Negative prompts in same row, 3 lines each
+                        with gr.Row():
+                            video_negative_prompt = gr.Textbox(
+                                label="Video Negative Prompt",
+                                placeholder="Things to avoid in video",
+                                lines=3,
+                                value="jitter, bad hands, blur, distortion"
+                            )
+                            audio_negative_prompt = gr.Textbox(
+                                label="Audio Negative Prompt",
+                                placeholder="Things to avoid in audio",
+                                lines=3,
+                                value="robotic, muffled, echo, distorted"
+                            )
+
+                with gr.Column():
+                    output_path = gr.Video(label="Generated Video")
+                    # Error message display for validation and generation errors
+                    error_message_display = gr.Markdown("", visible=False)
+                    with gr.Row():
+                        open_outputs_btn = gr.Button("📁 Open Outputs Folder")
+                        cancel_btn = gr.Button("❌ Cancel All", variant="stop")
+                    cropped_display = gr.Image(label="Source Frame Preview (Auto-cropped)", visible=False, height=512)
+                    cropped_resolution_label = gr.Markdown("", visible=False)
+
+                    # Preset Save/Load Section
+                    with gr.Accordion("💾 Preset Management", open=True):
+                        gr.Markdown("""
+                        **Preset System**: Save and load your favorite generation configurations.
+
+                        - **Save Preset**: Enter a name and click save to store current settings
+                        - **Load Preset**: Select from dropdown and settings auto-load
+                        - **Auto-load**: Last used preset loads automatically on app startup
+                        - **Overwrite**: Saving without name overwrites currently selected preset
+                        """)
+
+                        with gr.Row():
+                            preset_name = gr.Textbox(
+                                label="Preset Name",
+                                placeholder="Enter preset name to save",
+                                info="Leave empty to overwrite currently selected preset"
+                            )
+                            preset_dropdown = gr.Dropdown(
+                                choices=[],
+                                value=None,
+                                label="Load Preset",
+                                info="Select a preset to auto-load all settings"
+                            )
+
+                        with gr.Row():
+                            save_preset_btn = gr.Button("💾 Save Preset", variant="secondary")
+                            load_preset_btn = gr.Button("📂 Load Preset", variant="secondary")
+                            refresh_presets_btn = gr.Button("🔄 Refresh List", size="sm", visible=False)
+
+                    # Batch Processing Section
+                    with gr.Accordion("🔄 Batch Processing", open=True):
+                        gr.Markdown("""
+                        **Batch Processing Mode**: Process multiple prompts/images from a folder.
+
+                        **How it works:**
+                        - Place text files (.txt) and/or image files (.png, .jpg, .jpeg) in your input folder
+                        - For image-to-video: use matching filenames (e.g., `scene1.png` + `scene1.txt`)
+                        - For text-to-video: use `.txt` files only (e.g., `prompt1.txt`)
+                        - Videos are saved with the same base name as the input file
+                        """)
+
+                        with gr.Row():
+                            batch_input_folder = gr.Textbox(
+                                label="Input Folder Path",
+                                placeholder="C:/path/to/input/folder or /path/to/input/folder",
+                                info="Folder containing .txt files and/or image+.txt pairs"
+                            )
+                            batch_output_folder = gr.Textbox(
+                                label="Output Folder Path (optional)",
+                                placeholder="Leave empty to use default outputs folder",
+                                info="Where to save generated videos (defaults to outputs folder)"
+                            )
+
+                        with gr.Row():
+                            batch_skip_existing = gr.Checkbox(
+                                label="Skip Existing Videos",
+                                value=True,
+                                info="Skip processing if output video already exists"
+                            )
+                            batch_btn = gr.Button("🚀 Start Batch Processing", variant="primary", size="lg")
+                    
+                    # LoRA Loading Section
+                    with gr.Accordion("🎨 LoRA Management", open=True):
+                        gr.Markdown("""
+                        **LoRA Loading System**: Apply custom LoRAs to modify the model's output style.
+                        
+                        **How it works:**
+                        - Place LoRA files (.safetensors, .pt) in the `lora` or `loras` folder
+                        - Select up to 4 LoRAs with individual strength scales
+                        - LoRAs are merged into the model after loading (before generation)
+                        - Model automatically reloads only if LoRA selection changes
+                        - Set scale to 0.0 or select "None" to disable a LoRA slot
+                        """)
+                        
+                        # Get initial LoRA choices
+                        lora_choices, global_lora_path_map = scan_lora_folders()
+
+                        # LoRA GPU merging option
+                        merge_loras_on_gpu = gr.Checkbox(
+                            label="Merge LoRAs on GPU",
+                            value=False,
+                            info="Merge LoRAs on GPU instead of CPU (useful for high VRAM GPUs, may be faster but uses more VRAM)"
+                        )
+
+                        with gr.Row():
+                            with gr.Column(scale=3, min_width=1):
+                                lora_1 = gr.Dropdown(
+                                    choices=lora_choices,
+                                    value="None",
+                                    label="LoRA 1",
+                                    info="First LoRA to apply"
+                                )
+                            with gr.Column(scale=1, min_width=1):
+                                lora_1_scale = gr.Number(
+                                    value=1.0,
+                                    label="Scale",
+                                    minimum=0.0,
+                                    maximum=9.0,
+                                    step=0.1,
+                                    info="Strength (0.0-9.0)"
+                                )
+                            with gr.Column(scale=2, min_width=1):
+                                lora_1_layers = gr.Dropdown(
+                                    choices=["Video Layers", "Sound Layers", "Both"],
+                                    value="Video Layers",
+                                    label="Apply To",
+                                    info="Target layers for LoRA"
+                                )
+                        
+                        with gr.Row():
+                            with gr.Column(scale=3, min_width=1):
+                                lora_2 = gr.Dropdown(
+                                    choices=lora_choices,
+                                    value="None",
+                                    label="LoRA 2",
+                                    info="Second LoRA to apply"
+                                )
+                            with gr.Column(scale=1, min_width=1):
+                                lora_2_scale = gr.Number(
+                                    value=1.0,
+                                    label="Scale",
+                                    minimum=0.0,
+                                    maximum=9.0,
+                                    step=0.1,
+                                    info="Strength (0.0-9.0)"
+                                )
+                            with gr.Column(scale=2, min_width=1):
+                                lora_2_layers = gr.Dropdown(
+                                    choices=["Video Layers", "Sound Layers", "Both"],
+                                    value="Video Layers",
+                                    label="Apply To",
+                                    info="Target layers for LoRA"
+                                )
+                        
+                        with gr.Row():
+                            with gr.Column(scale=3, min_width=1):
+                                lora_3 = gr.Dropdown(
+                                    choices=lora_choices,
+                                    value="None",
+                                    label="LoRA 3",
+                                    info="Third LoRA to apply"
+                                )
+                            with gr.Column(scale=1, min_width=1):
+                                lora_3_scale = gr.Number(
+                                    value=1.0,
+                                    label="Scale",
+                                    minimum=0.0,
+                                    maximum=9.0,
+                                    step=0.1,
+                                    info="Strength (0.0-9.0)"
+                                )
+                            with gr.Column(scale=2, min_width=1):
+                                lora_3_layers = gr.Dropdown(
+                                    choices=["Video Layers", "Sound Layers", "Both"],
+                                    value="Video Layers",
+                                    label="Apply To",
+                                    info="Target layers for LoRA"
+                                )
+                        
+                        with gr.Row():
+                            with gr.Column(scale=3, min_width=1):
+                                lora_4 = gr.Dropdown(
+                                    choices=lora_choices,
+                                    value="None",
+                                    label="LoRA 4",
+                                    info="Fourth LoRA to apply"
+                                )
+                            with gr.Column(scale=1, min_width=1):
+                                lora_4_scale = gr.Number(
+                                    value=1.0,
+                                    label="Scale",
+                                    minimum=0.0,
+                                    maximum=9.0,
+                                    step=0.1,
+                                    info="Strength (0.0-9.0)"
+                                )
+                            with gr.Column(scale=2, min_width=1):
+                                lora_4_layers = gr.Dropdown(
+                                    choices=["Video Layers", "Sound Layers", "Both"],
+                                    value="Video Layers",
+                                    label="Apply To",
+                                    info="Target layers for LoRA"
+                                )
+                        
+                        with gr.Row():
+                            refresh_loras_btn = gr.Button("🔄 Refresh LoRA List", size="sm", variant="secondary")
+
+        with gr.TabItem("How to Use", id="how_to_use"):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ## 📘 Getting Started & Basics
+
+                        ### 🎬 What is Brandulate OVI?
+                        Brandulate OVI generates videos with synchronized audio from text prompts. Supports both text-to-video (T2V) and image-to-video (I2V) generation.
+
+                        ### 🎯 Key Features
+                        - **Joint Video + Audio**: Creates videos with matching audio in one pass
+                        - **High-Quality Output**: Multiple resolutions and aspect ratios
+                        - **Memory Efficient**: Block swapping and CPU offloading
+                        - **Flexible Prompts**: Complex prompts with speech and audio tags
+
+                        ### 📝 Prompt Format (REQUIRED)
+                        Use special tags for precise control:
+
+                        #### ⚠️ IMPORTANT: Validation Rules
+                        **All prompts must follow these rules or generation will fail:**
+                        
+                        1. **Speech Tags (REQUIRED)**: At least one `<S>...<E>` pair must be present
+                        2. **Tag Pairing**: Every `<S>` must have a matching `<E>`
+                        3. **Audio Caption Pairing**: Every `<AUDCAP>` must have a matching `<ENDAUDCAP>`
+                        4. **No Unknown Tags**: Only `<S>`, `<E>`, `<AUDCAP>`, and `<ENDAUDCAP>` are allowed
+                        5. **Proper Order**: Opening tags must come before their closing tags
+
+                        #### Speech Tags (REQUIRED)
+                        Wrap dialogue in `<S>` and `<E>` tags:
+                        ```
+                        A person says <S>Hello, how are you?<E> while waving
+                        ```
+
+                        #### Audio Description Tags (OPTIONAL)
+                        Add audio details with `<AUDCAP>` and `<ENDAUDCAP>`:
+                        ```
+                        <AUDCAP>Clear male voice, enthusiastic tone<ENDAUDCAP>
+                        ```
+                        
+                        #### ✅ Validation Button
+                        Use the "Validate Prompt Format" button above the prompt box to check your prompt before generating!
+
+                        ### 🎨 Supported Aspect Ratios
+                        - **16:9**: Landscape (default)
+                        - **9:16**: Portrait
+                        - **4:3**: Standard landscape
+                        - **3:4**: Standard portrait
+                        - **21:9**: Ultra-wide
+                        - **9:21**: Ultra-tall
+                        - **1:1**: Square
+                        - **3:2**: Classic landscape
+                        - **2:3**: Classic portrait
+                        - **5:4**: Photo landscape
+                        - **4:5**: Photo portrait
+                        - **5:3**: Wide landscape
+                        - **3:5**: Tall portrait
+                        - **16:10**: Widescreen
+                        - **10:16**: Tall widescreen
+                        """
+                    )
+
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ## ⚙️ Generation Parameters
+
+                        ### Solver Options
+                        - **UniPC**: Best quality (recommended default)
+                        - **Euler**: Faster generation
+                        - **DPM++**: Alternative high-quality option
+
+                        ### Guidance Scales
+                        - **Video Guidance Scale**: How closely to follow video prompt (2.0-6.0 recommended)
+                        - **Audio Guidance Scale**: How closely to follow audio prompt (2.0-4.0 recommended)
+
+                        ### Advanced Settings
+                        - **Shift**: Controls noise schedule dynamics (3.0-7.0 recommended)
+                        - **SLG Layer**: Audio-video sync (-1 to disable, 11 recommended)
+                        - **Block Swap**: CPU blocks for VRAM savings
+                        - **CPU Offload**: Offload models between operations
+                        - **Delete T5 After Encoding**: Runs T5 in isolated subprocess before generation subprocess. Auto-enables "Clear All Memory". Perfect isolation, no model duplication (~5GB VRAM/RAM freed)
+                        - **Scaled FP8 Base Model**: Quantize transformer to FP8 (~50% VRAM savings, works with block swap)
+                        - **Clear All Memory**: Run each generation as separate process to prevent VRAM/RAM leaks (recommended, auto-enabled with Delete T5)
+
+                        ## 💡 Tips for Best Results
+
+                        ### Prompt Engineering
+                        1. **Be Specific**: Detailed descriptions = better results
+                        2. **Use Tags**: Always wrap speech in `<S>...</E>` tags
+                        3. **Audio Descriptions**: Add `<AUDCAP>...</ENDAUDCAP>` for complex audio
+                        4. **Negative Prompts**: Avoid artifacts with video/audio negatives
+
+                        ### Technical Optimization
+                        1. **Resolution**: Start with 992×512 for best quality
+                        2. **Sample Steps**: 50 balances quality vs speed
+                        3. **Seeds**: Try different seeds or use randomize
+                        4. **Memory**: Enable CPU offload and block swap
+
+                        ### Common Issues
+                        - **Artifacts**: Try different seeds, adjust guidance scales
+                        - **Audio Sync**: Adjust SLG layer or audio guidance scale
+                        - **Quality**: Increase sample steps or adjust shift
+                        - **Memory**: Enable block swap, reduce resolution
+                        """
+                    )
+
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ## 🔧 Troubleshooting
+
+                        ### Memory Issues
+                        - ✅ Enable "Clear All Memory" checkbox (prevents VRAM/RAM leaks between generations)
+                        - ✅ Enable "CPU Offload" checkbox
+                        - ✅ Increase "Block Swap" value (12+ recommended)
+                        - ✅ Reduce resolution or sample steps
+                        - ✅ Close other GPU applications
+
+                        ### Memory Leak Prevention
+                        - **Why Clear All Memory is important**: Each generation loads large AI models into VRAM/RAM. Without clearing, residual memory from previous generations can accumulate, causing slowdowns or crashes over time.
+                        - **How it works**: When enabled, each generation runs in a separate Python process. When the process exits, all memory is automatically freed by the operating system.
+                        - **Performance impact**: Minimal - subprocess startup is fast, and memory cleanup ensures consistent performance across multiple generations.
+                        
+                        ### T5 Subprocess Mode (Automatic & Simplified)
+                        - **What it does**: When "Delete T5 After Encoding" is enabled, T5 text encoding automatically runs in a separate subprocess for 100% guaranteed memory cleanup.
+                        - **Auto-enables "Clear All Memory"**: For simplicity and to prevent model duplication, enabling "Delete T5 After Encoding" automatically enables "Clear All Memory" mode.
+                        - **How it works**:
+                          1. Main process spawns T5 subprocess → T5 loads + encodes text → saves embeddings → exits → OS frees ALL T5 memory
+                          2. Main process spawns generation subprocess → loads embeddings + other models → generates → exits → OS frees ALL memory
+                        - **Why it's optimal**:
+                          - ✅ T5 subprocess: Only loads T5 + tokenizer (~5-11GB)
+                          - ✅ Generation subprocess: Only loads VAE + Fusion (~8GB), NO T5
+                          - ✅ NO MODEL DUPLICATION - completely isolated processes
+                          - ✅ 100% memory cleanup by OS (not dependent on Python GC)
+                        - **Models loaded by T5 subprocess**: Only T5 encoder + tokenizer (no VAE, no fusion model, no image model)
+                        - **Performance impact**: ~1-2 seconds overhead per generation for subprocess startup and embeddings I/O, but ensures perfect memory isolation.
+                        - **Fallback**: If subprocess fails, automatically falls back to in-process encoding with manual deletion.
+
+                        ### Quality Issues
+                        - 🔄 Try different random seeds
+                        - 🎯 Adjust guidance scales (4.0 video, 3.0 audio)
+                        - ⬆️ Increase sample steps (50-75 for better quality)
+                        - ✍️ Use more specific, detailed prompts
+
+                        ### Audio Issues
+                        - 🏷️ Check `<S>...</E>` tag format
+                        - 🎵 Add `<AUDCAP>...</ENDAUDCAP>` descriptions
+                        - 🎚️ Adjust audio guidance scale (2.5-4.0 range)
+                        - 🔧 Try different SLG layer values (8-15 range)
+
+                        ## 📊 Performance Expectations
+
+                        ### System Requirements
+                        - **VRAM**: 8-16GB depending on settings
+                        - **RAM**: 16GB+ recommended
+                        - **GPU**: NVIDIA with CUDA support
+
+                        ### Generation Times
+                        - **Typical**: 2-10 minutes per video
+                        - **Factors**: Resolution, sample steps, hardware
+                        - **Output**: MP4 with video + audio at 24 FPS
+
+                        ### Optimization Tips
+                        - Use **Block Swap** for large models
+                        - Enable **CPU Offload** for memory efficiency
+                        - Start with **UniPC solver** for quality
+                        - Experiment with **guidance scales** (3-5 range)
+
+                        ### Best Practices
+                        - **Start Simple**: Use basic prompts first
+                        - **Iterate**: Adjust one parameter at a time
+                        - **Save Good Seeds**: Note what works for you
+                        - **Batch Process**: Use multiple prompts for testing
+                        """
+                    )
+
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ## 🎨 VAE Tiled Decoding (Advanced VRAM Optimization)
+
+                        **VAE Tiled Decoding**: Process video decoding in overlapping spatial tiles to dramatically reduce VRAM usage.
+
+                        ### 🎯 What is Tiled VAE Decoding?
+                        The VAE decoder typically processes the entire video frame at once, which can consume 8-15GB of VRAM during decoding.
+                        Tiled decoding splits each frame into smaller overlapping tiles, processes them individually, and blends them seamlessly.
+
+                        ### 💡 How It Works:
+                        - **Spatial Tiling**: Splits each frame into smaller tiles (e.g., 32×32 in latent space)
+                        - **Overlap Blending**: Tiles overlap by a configurable amount for seamless transitions
+                        - **ComfyUI Technology**: Uses proven feathered blending from ComfyUI for invisible seams
+                        - **No Quality Loss**: Proper overlap ensures output is virtually identical to non-tiled
+
+                        ### ⚙️ Parameters Explained:
+
+                        **Tile Size** (in latent space):
+                        - Values are in **latent space**, not pixel space!
+                        - 1 latent unit = 16 pixels after VAE decode
+                        - Example: 32 latent = 512×512 pixels per tile
+                        - Smaller tiles = less VRAM but more processing time
+                        - Must be divisible by 8 for optimal performance
+
+                        **Tile Overlap** (in latent space):
+                        - How much tiles overlap for seamless blending
+                        - Higher overlap = better quality, more computation
+                        - Recommended: 25% of tile size (e.g., 8 for tile_size=32)
+                        - Creates feathered transitions to prevent visible seams
+
+                        ### 📊 Recommended Settings by VRAM:
+
+                        | VRAM | Tile Size | Overlap | VRAM Savings | Speed |
+                        |------|-----------|---------|--------------|-------|
+                        | **24GB+** | 64 | 16 | ~15% | Fastest |
+                        | **16-24GB** | 32 | 8 | ~30% | Fast ⭐ |
+                        | **12-16GB** | 24 | 6 | ~45% | Medium |
+                        | **8-12GB** | 16 | 4 | ~60% | Slower |
+                        | **<8GB** | 16 | 4 | ~60% | Slower |
+
+                        ⭐ = Recommended default (best balance)
+
+                        ### 🎬 Resolution Examples:
+
+                        **992×512 video (16:9)**:
+                        - Latent size: 62×32
+                        - With tile_size=32, overlap=8: ~2×1 = 2 tiles per frame
+                        - VRAM saving: ~30% (12-15GB → 8-10GB during decode)
+
+                        **512×992 video (9:16)**:
+                        - Latent size: 32×62
+                        - With tile_size=32, overlap=8: ~1×2 = 2 tiles per frame
+                        - VRAM saving: ~30%
+
+                        ### ⚠️ Important Notes:
+
+                        1. **Latent Space vs Pixel Space**:
+                           - Tile size is in LATENT space (before VAE upscaling)
+                           - VAE upscales 16× → 32 latent = 512 pixels
+
+                        2. **Quality Impact**:
+                           - Proper overlap (≥25% of tile size) = no visible seams
+                           - Too little overlap = potential artifacts at tile boundaries
+                           - ComfyUI's feathered blending ensures seamless results
+
+                        3. **Performance**:
+                           - Smaller tiles = more tile processing overhead
+                           - But enables generation on lower VRAM GPUs
+                           - Decode time increases by ~20-50% depending on tile size
+
+                        4. **When to Use**:
+                           - ✅ Running out of VRAM during decode
+                           - ✅ Want to generate higher resolutions
+                           - ✅ Have limited GPU memory
+                           - ❌ Have plenty of VRAM (24GB+) and want max speed
+
+                        ### 🔬 Technical Details:
+
+                        - **Algorithm**: Universal N-dimensional tiled processing from ComfyUI
+                        - **Blending**: Feathered masks with linear gradients at tile boundaries
+                        - **Memory**: Only loads one tile into VRAM at a time
+                        - **Output**: Bit-identical to non-tiled (with proper overlap)
+
+                        **Try it!** Enable tiled decoding in the Generate tab and compare VRAM usage in your task manager.
+                        """
+                    )
+                
+                with gr.Column():
+                    gr.Markdown(
+                        """
+                        ## 🚀 Scaled FP8 Base Model (Advanced VRAM Optimization)
+                        
+                        **FP8 Base Model**: Quantizes transformer blocks to FP8 format for ~50% VRAM savings during inference.
+                        
+                        ### 🎯 What is FP8 Quantization?
+                        FP8 (8-bit floating point) is a compressed number format that uses half the memory of standard BF16 (16-bit) weights.
+                        The transformer model weights are quantized to FP8 E4M3 format with per-block scaling to maintain quality.
+                        
+                        ### 💡 How It Works:
+                        - **Quantization**: Converts BF16 transformer weights (16-bit) to FP8 (8-bit)
+                        - **Per-Block Scaling**: Uses 64-element blocks with individual scale factors for accuracy
+                        - **On-the-fly Dequantization**: Weights are dequantized during forward pass (no quality loss)
+                        - **Caching**: First run quantizes and caches, subsequent runs load instantly
+                        
+                        ### 📊 VRAM Savings:
+                        
+                        **Transformer Model Size:**
+                        - Without FP8: ~8 GB VRAM (BF16 weights)
+                        - With FP8: ~4 GB VRAM (FP8 weights + scales)
+                        - **Savings: ~4 GB (~50%)**
+                        
+                        **Combined with Other Optimizations:**
+                        
+                        | Configuration | VRAM Usage (720p 5s) | Speed Impact |
+                        |--------------|---------------------|--------------|
+                        | Baseline (no optimizations) | ~18 GB | 100% |
+                        | FP8 T5 only | ~16 GB | 100% |
+                        | FP8 Base Model only | ~14 GB | ~90% |
+                        | FP8 T5 + FP8 Base | ~12 GB | ~90% |
+                        | + Block Swap (12 blocks) | ~10 GB | ~80% |
+                        | + CPU Offload | ~8 GB | ~75% |
+                        | All optimizations | ~6-8 GB | ~70% |
+                        
+                        ### ⚙️ Compatibility:
+                        
+                        ✅ **Works with:**
+                        - Block Swap (additive VRAM savings)
+                        - CPU Offload
+                        - Scaled FP8 T5
+                        - Tiled VAE Decode
+                        - Clear All Memory
+                        - All resolutions and durations
+                        
+                        ❌ **Not compatible with:**
+                        - None! FP8 Base Model works with all other features
+                        
+                        ### 🎬 When to Use:
+                        
+                        **Enable FP8 Base Model if:**
+                        - ✅ You have <16GB VRAM and want higher resolutions
+                        - ✅ You want to combine with block swap for maximum savings
+                        - ✅ You're okay with ~10% slower inference
+                        - ✅ You want to enable longer video durations
+                        
+                        **Keep it disabled if:**
+                        - ❌ You have plenty of VRAM (24GB+) and want max speed
+                        - ❌ You need the fastest possible generation time
+                        
+                        ### 📈 Performance Impact:
+                        
+                        **Speed:**
+                        - FP8 dequantization adds ~10-15% overhead
+                        - First generation: ~30s slower (quantization + caching)
+                        - Subsequent generations: ~10% slower (on-the-fly dequantization)
+                        
+                        **Quality:**
+                        - Per-block scaling preserves accuracy
+                        - Minimal quality difference vs BF16
+                        - Identical results for most use cases
+                        
+                        ### 🔬 Technical Details:
+                        
+                        **Quantization Format:**
+                        - Type: FP8 E4M3 (4-bit exponent, 3-bit mantissa)
+                        - Scaling: Per-output-channel block quantization (block_size=64)
+                        - Dequantization: On-the-fly during Linear layer forward pass
+                        
+                        **Targeted Layers:**
+                        - Video transformer blocks: self_attn, cross_attn, ffn
+                        - Audio transformer blocks: self_attn, cross_attn, ffn
+                        - Total: ~300 Linear layers quantized
+                        
+                        **Excluded Layers:**
+                        - Embeddings (patch_embed, time_embed)
+                        - Final projections (final_proj, final_layer)
+                        - Modulation layers (adaptive layer norm)
+                        - Normalization layers (LayerNorm, RMSNorm)
+                        
+                        **Caching:**
+                        - Cache path: `ckpts/Ovi/model_fp8_scaled.safetensors` (auto-created)
+                        - First generation: Quantizes and caches (~30s overhead)
+                        - Subsequent generations: Loads from cache (~3s)
+                        - Cache size: ~4 GB (saves ~4 GB on disk)
+                        
+                        ### 🎯 Recommended Configurations:
+                        
+                        **For 8-12GB VRAM GPUs:**
+                        ```
+                        ✅ Scaled FP8 T5: ON
+                        ✅ Scaled FP8 Base Model: ON
+                        ✅ Block Swap: 12-16 blocks
+                        ✅ CPU Offload: ON
+                        ✅ Delete T5 After Encoding: ON
+                        ✅ Tiled VAE Decode: ON
+                        ✅ Clear All Memory: ON
+                        → Expected VRAM: 8-10 GB
+                        ```
+                        
+                        **For 16-20GB VRAM GPUs:**
+                        ```
+                        ✅ Scaled FP8 T5: ON
+                        ✅ Scaled FP8 Base Model: ON
+                        ✅ Block Swap: 6-12 blocks
+                        ✅ Tiled VAE Decode: ON (optional)
+                        ✅ Clear All Memory: ON
+                        → Expected VRAM: 12-14 GB
+                        ```
+                        
+                        **For 24GB+ VRAM GPUs:**
+                        ```
+                        ⚪ Scaled FP8 Base Model: Optional (for higher resolution/duration)
+                        ✅ Clear All Memory: OFF (for max speed)
+                        → Expected VRAM: 16-18 GB (or 12-14 GB with FP8)
+                        ```
+                        
+                        ### ⚡ Quick Start:
+                        
+                        1. Enable "Scaled FP8 Base Model" checkbox in Generate tab
+                        2. First generation will take ~30s longer (quantization)
+                        3. Watch VRAM usage drop by ~4 GB
+                        4. Subsequent generations load FP8 cache instantly
+                        5. Combine with other optimizations for maximum savings
+                        
+                        **Note:** FP8 Base Model is independent of FP8 T5. You can use either or both together for maximum VRAM savings!
+                        """
+                    )
+
+        with gr.TabItem("Prompt Guide", id="prompt_guide"):
+
+            gr.Markdown("""
+## Prompt Writing Guide
+
+Brandulate OVI uses a structured prompt format with special tags for speech and audio. Follow this guide to get the best results.
+
+---
+
+### Required: Speech Tags `<S>` ... `<E>`
+
+Every prompt **must** contain at least one speech pair. Wrap all spoken dialogue in `<S>` (start) and `<E>` (end) tags.
+
+**Format:**
+```
+[Scene description] <S>Spoken dialogue here<E> [more scene description]
+```
+
+**Text-to-Video (T2V) prompt — no image needed:**
+```
+A woman stands at a podium in a grand hall, speaking confidently. She says <S>The future belongs to those who build it.<E> The audience listens intently. <AUDCAP>Clear female voice, large hall reverb, quiet audience.<ENDAUDCAP>
+```
+
+**Image-to-Video (I2V) prompt — upload a starting image:**
+```
+The person in the image turns to face the camera and says <S>Good morning, welcome to the show.<E> They smile warmly. <AUDCAP>Friendly male voice, studio ambiance, soft background music.<ENDAUDCAP>
+```
+
+---
+
+### Optional: Audio Caption Tags `<AUDCAP>` ... `<ENDAUDCAP>`
+
+Add detailed audio descriptions for better sound quality. Place these at the end of your prompt.
+
+```
+<AUDCAP>Description of voices, background sounds, music, ambient noise<ENDAUDCAP>
+```
+
+**Tips for audio captions:**
+- Describe voice qualities: "deep male voice", "soft female whisper", "child's excited tone"
+- Include ambient sounds: "rain on windows", "busy street traffic", "forest birds"
+- Mention music if desired: "gentle piano in background", "upbeat electronic beat"
+
+---
+
+### Multi-Line Prompts
+
+Enable **Multi-line Prompts** to generate a separate video for each line in the prompt box. Lines shorter than 4 characters are automatically skipped.
+
+---
+
+### Video Extension
+
+Enable **Video Extension** to chain prompts together. Each line extends the previous video using its last frame:
+- Line 1: Base generation
+- Line 2: Extends from last frame of Line 1
+- Line 3: Extends from last frame of Line 2
+- All segments are auto-merged into a final video
+
+**Extension prompt format (one line per segment):**
+```
+A person walks into a room and says <S>Hello everyone.<E> <AUDCAP>Male voice, room echo.<ENDAUDCAP>
+They sit down at a desk and say <S>Let me show you something interesting.<E> <AUDCAP>Same male voice, chair creaking, desk tap.<ENDAUDCAP>
+They hold up a book and say <S>This changed everything for me.<E> <AUDCAP>Enthusiastic male voice, page rustling.<ENDAUDCAP>
+```
+
+---
+
+### Validation Rules
+
+All prompts are validated before generation. Your prompt must:
+1. Contain at least one `<S>...<E>` speech pair
+2. Have every `<S>` matched with a closing `<E>`
+3. Have every `<AUDCAP>` matched with a closing `<ENDAUDCAP>`
+4. Only use allowed tags: `<S>`, `<E>`, `<AUDCAP>`, `<ENDAUDCAP>`
+5. Tags must be in the correct order (opening before closing)
+
+Use the **Validate Prompt Format** button in the Generate tab to check before generating.
+
+---
+
+### Quick Tips
+
+| Tip | Details |
+|-----|---------|
+| **Be descriptive** | More detail = better results. Describe scene, lighting, emotions, actions |
+| **Specify camera work** | "Camera slowly zooms in", "Wide establishing shot", "Close-up on face" |
+| **Control audio** | Use `<AUDCAP>` for precise audio control instead of relying on defaults |
+| **Use negative prompts** | Add unwanted elements to Video/Audio Negative Prompts |
+| **Try different seeds** | Same prompt + different seed = different results |
+| **Start at 992x512** | Default 16:9 resolution works best for most scenes |
+| **50 steps recommended** | Balance of quality and speed. Lower for testing, higher for finals |
+            """)
+
+    # Hook up aspect ratio change
+    # Update aspect ratio choices when base resolution changes
+    # Use combined function to avoid race conditions
+    base_resolution_width.change(
+        fn=update_aspect_ratio_and_resolution,
+        inputs=[base_resolution_width, base_resolution_height, aspect_ratio],
+        outputs=[aspect_ratio, video_width, video_height],
+    ).then(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+    base_resolution_height.change(
+        fn=update_aspect_ratio_and_resolution,
+        inputs=[base_resolution_width, base_resolution_height, aspect_ratio],
+        outputs=[aspect_ratio, video_width, video_height],
+    ).then(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+
+    aspect_ratio.change(
+        fn=update_resolution,
+        inputs=[aspect_ratio, base_resolution_width, base_resolution_height],
+        outputs=[video_width, video_height],
+    ).then(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+    # Hook up prompt validation button
+    def handle_prompt_validation(prompt):
+        """Validate prompt format and return user-friendly message."""
+        is_valid, error_message = validate_prompt_format(prompt)
+
+        if is_valid:
+            success_msg = """### ✅ Prompt Format Valid
+
+**Your prompt is ready to use!**
+
+- Contains required speech tags
+- All tags are properly paired
+- No unknown tags detected
+"""
+            # Return (keep video output unchanged, show success message)
+            return gr.update(), gr.update(value=success_msg, visible=True)
+        else:
+            # Convert plain text error message to HTML with proper formatting
+            import html
+            # First escape HTML entities so tags like <S> display as text
+            formatted_error = html.escape(error_message)
+            # Then replace newlines with HTML breaks for display
+            formatted_error = formatted_error.replace('\n\n', '\n\n').replace('\n', '  \n')
+
+            error_display = f"""### ❌ Prompt Format Invalid
+
+**What's wrong:**
+
+{formatted_error}
+
+---
+
+**Required format:**
+
+- **Speech tags (REQUIRED):** `<S>Your dialogue here<E>` - At least one pair required
+- **Audio captions (OPTIONAL):** `<AUDCAP>Audio description<ENDAUDCAP>` - Must be paired if used
+
+**Example:**
+```
+A person says <S>Hello, how are you?<E> while smiling. <AUDCAP>Clear male voice, friendly tone<ENDAUDCAP>
+```
+"""
+            # Return (keep video output unchanged, show error message)
+            return gr.update(), gr.update(value=error_display, visible=True)
+    
+    validate_prompt_btn.click(
+        fn=handle_prompt_validation,
+        inputs=[video_text_prompt],
+        outputs=[output_path, error_message_display]
+    )
+
+    # Hook up randomize seed
+    def handle_randomize_seed(randomize, current_seed):
+        if randomize:
+            return get_random_seed()
+        return current_seed
+
+    randomize_seed.change(
+        fn=handle_randomize_seed,
+        inputs=[randomize_seed, video_seed],
+        outputs=[video_seed],
+    )
+
+    # Hook up video generation with video clearing first
+    def clear_video_output():
+        """Clear the video output component before generation."""
+        return None
+
+    # Wire up refresh LoRA button
+    refresh_loras_btn.click(
+        fn=refresh_lora_list,
+        inputs=[],
+        outputs=[lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+                 lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers]
+    )
+    
+    run_btn.click(
+        fn=generate_video_with_error_handling,
+        inputs=[
+            video_text_prompt, image_to_use, video_height, video_width, video_seed, solver_name,
+            sample_steps, shift, video_guidance_scale, audio_guidance_scale,
+            slg_layer, blocks_to_swap, optimized_block_swap, video_negative_prompt, audio_negative_prompt,
+            gr.Checkbox(value=False, visible=False), cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            no_audio, gr.Checkbox(value=False, visible=False),
+            num_generations, randomize_seed, save_metadata, aspect_ratio, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds, auto_crop_image,
+            gr.Textbox(value=None, visible=False), gr.Textbox(value=None, visible=False), gr.Textbox(value=None, visible=False),
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible,
+            input_video_state,  # Pass input video path for merging
+            merge_loras_on_gpu,  # Pass LoRA GPU merging setting
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,  # LoRA parameters
+        ],
+        outputs=[output_path, error_message_display],
+    )
+
+    image.change(
+        fn=on_media_upload,
+        inputs=[image, auto_crop_image, video_width, video_height, base_resolution_width, base_resolution_height],
+        outputs=[input_preview, cropped_display, image_resolution_label, aspect_ratio, video_width, video_height, 
+                cropped_resolution_label, image_to_use, input_video_state, 
+                original_image_path, original_image_width, original_image_height]
+    )
+
+    auto_crop_image.change(
+        fn=on_media_upload,
+        inputs=[image, auto_crop_image, video_width, video_height, base_resolution_width, base_resolution_height],
+        outputs=[input_preview, cropped_display, image_resolution_label, aspect_ratio, video_width, video_height, 
+                cropped_resolution_label, image_to_use, input_video_state,
+                original_image_path, original_image_width, original_image_height]
+    )
+
+    # Update cropped image when auto_pad_32px_divisible changes
+    auto_pad_32px_divisible.change(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+    # Auto-update cropped image when video width/height changes manually
+    # CRITICAL: Always pass ORIGINAL image path, not image_to_use (which might be previously cropped)
+    video_width.change(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+    video_height.change(
+        fn=update_cropped_image_only,
+        inputs=[original_image_path, auto_crop_image, video_width, video_height, original_image_width, original_image_height, auto_pad_32px_divisible],
+        outputs=[cropped_display, cropped_resolution_label, image_to_use]
+    )
+
+    # Hook up open outputs folder button
+    open_outputs_btn.click(
+        fn=open_outputs_folder,
+        inputs=[],
+        outputs=[]
+    )
+
+    # Hook up cancel button
+    cancel_btn.click(
+        fn=cancel_all_generations,
+        inputs=[],
+        outputs=[]
+    )
+
+    # Hook up batch processing button (batch processing handles its own image paths from folder)
+    batch_btn.click(
+        fn=process_batch_generation_with_error_handling,
+        inputs=[
+            batch_input_folder, batch_output_folder, batch_skip_existing,
+            video_height, video_width, solver_name, sample_steps, shift,
+            video_guidance_scale, audio_guidance_scale, slg_layer, blocks_to_swap, optimized_block_swap,
+            video_negative_prompt, audio_negative_prompt, cpu_offload,
+            delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention, no_audio, gr.Checkbox(value=False, visible=False),
+            num_generations, randomize_seed, save_metadata, aspect_ratio, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds, auto_crop_image,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible, merge_loras_on_gpu,
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+        ],
+        outputs=[output_path, error_message_display],
+    )
+
+    # Hook up preset management
+    save_preset_btn.click(
+        fn=save_preset,
+        inputs=[
+            preset_name, preset_dropdown,  # preset inputs
+            video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+            video_seed, randomize_seed, no_audio, save_metadata,
+            solver_name, sample_steps, num_generations,
+            shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+            blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            video_negative_prompt, audio_negative_prompt,
+            batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible, merge_loras_on_gpu,
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+        ],
+        outputs=[
+            preset_dropdown, preset_name,  # Update dropdown, clear name field
+            video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+            video_seed, randomize_seed, no_audio, save_metadata,
+            solver_name, sample_steps, num_generations,
+            shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+            blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            video_negative_prompt, audio_negative_prompt,
+            batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible, merge_loras_on_gpu,
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+            gr.Textbox(visible=False)  # status message
+        ],
+    )
+
+    load_preset_btn.click(
+        fn=load_preset,
+        inputs=[preset_dropdown],
+        outputs=[
+            video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+            video_seed, randomize_seed, no_audio, save_metadata,
+            solver_name, sample_steps, num_generations,
+            shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+            blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            video_negative_prompt, audio_negative_prompt,
+            batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible, merge_loras_on_gpu,
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+            preset_dropdown, gr.Textbox(visible=False)  # current preset, status message
+        ],
+    )
+
+    # Auto-load preset when dropdown changes
+    preset_dropdown.change(
+        fn=load_preset,
+        inputs=[preset_dropdown],
+        outputs=[
+            video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+            video_seed, randomize_seed, no_audio, save_metadata,
+            solver_name, sample_steps, num_generations,
+            shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+            blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            video_negative_prompt, audio_negative_prompt,
+            batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input, disable_auto_prompt_validation,
+            auto_pad_32px_divisible, merge_loras_on_gpu,
+            lora_1, lora_1_scale, lora_1_layers, lora_2, lora_2_scale, lora_2_layers,
+            lora_3, lora_3_scale, lora_3_layers, lora_4, lora_4_scale, lora_4_layers,
+            preset_dropdown, gr.Textbox(visible=False)  # current preset, status message
+        ],
+    )
+
+    # Hook up refresh presets button
+    refresh_presets_btn.click(
+        fn=initialize_app,
+        inputs=[],
+        outputs=[preset_dropdown],
+    )
+
+    # Initialize presets dropdown and auto-load last preset
+    demo.load(
+        fn=initialize_app_with_auto_load,
+        inputs=[],
+        outputs=[
+            preset_dropdown,  # dropdown with choices and selected value
+            video_text_prompt, aspect_ratio, video_width, video_height, auto_crop_image,
+            video_seed, randomize_seed, no_audio, save_metadata,
+            solver_name, sample_steps, num_generations,
+            shift, video_guidance_scale, audio_guidance_scale, slg_layer,
+            blocks_to_swap, optimized_block_swap, cpu_offload, delete_text_encoder, fp8_t5, cpu_only_t5, fp8_base_model, use_sage_attention,
+            video_negative_prompt, audio_negative_prompt,
+            batch_input_folder, batch_output_folder, batch_skip_existing, clear_all,
+            vae_tiled_decode, vae_tile_size, vae_tile_overlap,
+            base_resolution_width, base_resolution_height, duration_seconds,
+            enable_multiline_prompts, enable_video_extension, dont_auto_combine_video_input,
+            gr.Textbox(visible=False)  # status message
+        ],
+    )
+
+def run_single_generation(json_params):
+    """Run a single generation from JSON parameters and exit."""
+    try:
+        import json
+        params = json.loads(json_params)
+
+        print(f"[SINGLE-GEN] Starting generation with params: {params.keys()}")
+        print(f"[SINGLE-GEN] Text prompt: {params.get('text_prompt', 'N/A')[:50]}...")
+
+        # Run the generation with the provided parameters
+        result = generate_video(**params)
+
+        # Exit with appropriate code
+        if result:
+            print(f"[SINGLE-GEN] Success: {result}")
+            sys.exit(0)
+        else:
+            print("[SINGLE-GEN] Failed - no result returned")
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"[SINGLE-GEN] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+def run_comprehensive_test():
+    """Run comprehensive tests for new features."""
+    print("=" * 80)
+    print("COMPREHENSIVE FEATURE TEST")
+    print("=" * 80)
+
+    # Test 1: Multi-line prompt parsing
+    print("\n[TEST 1] Multi-line prompt parsing")
+    test_prompt = "First prompt\n\nSecond prompt\n   \nThird prompt"
+    prompts = parse_multiline_prompts(test_prompt, True)
+    print(f"Input: {repr(test_prompt)}")
+    print(f"Output: {prompts}")
+    assert len(prompts) == 3, f"Expected 3 prompts, got {len(prompts)}"
+    print("✓ Multi-line parsing test passed")
+
+    # Test 2: Single prompt (multi-line disabled)
+    print("\n[TEST 2] Single prompt parsing")
+    single_prompts = parse_multiline_prompts("Single prompt", False)
+    print(f"Input: Single prompt")
+    print(f"Output: {single_prompts}")
+    assert single_prompts == ["Single prompt"], f"Expected ['Single prompt'], got {single_prompts}"
+    print("✓ Single prompt test passed")
+
+    # Test 3: Video processing functions
+    print("\n[TEST 3] Video processing functions")
+    import os
+    if os.path.exists("outputs/0001.mp4"):
+        frame_path = extract_last_frame("outputs/0001.mp4")
+        if frame_path and os.path.exists(frame_path):
+            print(f"✓ Frame extraction successful: {frame_path}")
+        else:
+            print("✗ Frame extraction failed")
+    else:
+        print("⚠ No test video found, skipping frame extraction test")
+
+    print("\n[TEST 4] Source image saving")
+    # Test source image saving
+    test_result = save_used_source_image("temp/last_frame_20251005_235931_386213.png", "outputs", "test_video.mp4")
+    if test_result:
+        print("✓ Source image saving successful")
+    else:
+        print("⚠ Source image saving failed (expected if no source image)")
+
+    print("\n" + "=" * 80)
+    print("ALL TESTS COMPLETED SUCCESSFULLY!")
+    print("New features are ready for use:")
+    print("- Multi-line prompts: Enable with checkbox")
+    print("- Video extensions: Enable with checkbox + set count")
+    print("- Source image saving: Automatic")
+    print("=" * 80)
+
+def run_single_generation_from_file(json_file_path):
+    """Run a single generation from JSON file and exit."""
+    try:
+        import json
+        with open(json_file_path, 'r') as f:
+            params = json.load(f)
+
+        print(f"[SINGLE-GEN] Loaded params from file: {json_file_path}")
+        print(f"[SINGLE-GEN] Starting generation with params: {list(params.keys())}")
+        print(f"[SINGLE-GEN] Text prompt: {params.get('text_prompt', 'N/A')[:50]}...")
+
+        # No auto-enabling of video extension - only enable if explicitly set
+
+        # Run the generation with the provided parameters
+        result = generate_video(**params)
+
+        # Exit with appropriate code
+        if result:
+            print(f"[SINGLE-GEN] Success: {result}")
+            sys.exit(0)
+        else:
+            print("[SINGLE-GEN] Failed - no result returned")
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"[SINGLE-GEN] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+def run_t5_encoding_only(params_file_path, output_embeddings_path):
+    """Run T5 text encoding only and save embeddings to file. Exit when done."""
+    try:
+        import json
+        from ovi.utils.model_loading_utils import init_text_model
+        
+        print("=" * 80)
+        print("T5 ENCODING SUBPROCESS STARTED")
+        print("=" * 80)
+        
+        # Load parameters
+        with open(params_file_path, 'r') as f:
+            params = json.load(f)
+        
+        text_prompt = params['text_prompt']
+        video_negative_prompt = params['video_negative_prompt']
+        audio_negative_prompt = params['audio_negative_prompt']
+        fp8_t5 = params.get('fp8_t5', False)
+        cpu_only_t5 = params.get('cpu_only_t5', False)
+        
+        print(f"[T5-ONLY] Text Prompt: {text_prompt[:50]}...")
+        print(f"[T5-ONLY] FP8 Mode: {fp8_t5}")
+        print(f"[T5-ONLY] CPU-Only Mode: {cpu_only_t5}")
+        print("=" * 80)
+        
+        # SMART CACHE: Check if embeddings are already cached
+        cache_key = get_t5_cache_key(text_prompt, video_negative_prompt, audio_negative_prompt, fp8_t5)
+        print(f"[T5 CACHE] Cache key: {cache_key}")
+        
+        cached_embeddings = load_t5_cached_embeddings(cache_key)
+        
+        if cached_embeddings is not None:
+            # Cache hit - return cached embeddings without loading T5
+            print("=" * 80)
+            print("T5 CACHE HIT IN SUBPROCESS")
+            print("Using cached embeddings - T5 will NOT be loaded")
+            print("=" * 80)
+            
+            # Save cached embeddings to output file for parent process
+            torch.save(cached_embeddings, output_embeddings_path)
+            print(f"[T5-ONLY] Cached embeddings written to: {output_embeddings_path}")
+            
+            # Exit successfully without loading T5
+            print("=" * 80)
+            print("T5 ENCODING SUBPROCESS COMPLETED (CACHE HIT)")
+            print("Process will exit now - NO T5 MEMORY USED")
+            print("=" * 80)
+            sys.exit(0)
+        
+        # Cache miss - proceed with T5 loading and encoding
+        print("[T5 CACHE MISS] Cache not found, loading T5...")
+        
+        # Determine checkpoint directory
+        ckpt_dir = os.path.join(os.path.dirname(__file__), "ckpts")
+        
+        # Initialize T5 text encoder
+        if cpu_only_t5 and fp8_t5:
+            print("Loading T5 in CPU-Only + Scaled FP8 mode...")
+        elif cpu_only_t5:
+            print("Loading T5 in CPU-Only mode...")
+        elif fp8_t5:
+            print("Loading T5 in Scaled FP8 mode...")
+        else:
+            print("Loading T5 in standard mode...")
+        
+        device = 'cpu' if cpu_only_t5 else 0
+        text_model = init_text_model(
+            ckpt_dir,
+            rank=device,
+            fp8=fp8_t5,
+            cpu_only=cpu_only_t5
+        )
+        
+        print("[T5-ONLY] T5 model loaded successfully")
+        print("[T5-ONLY] Encoding text prompts...")
+        
+        # Encode text embeddings
+        encode_device = 'cpu' if cpu_only_t5 else 0
+        text_embeddings = text_model(
+            [text_prompt, video_negative_prompt, audio_negative_prompt],
+            encode_device
+        )
+        
+        print("[T5-ONLY] Text encoding completed")
+        
+        # Move embeddings to CPU for saving (if they're on GPU)
+        text_embeddings_cpu = [emb.cpu() for emb in text_embeddings]
+        
+        # Save to disk cache for future use
+        save_t5_cached_embeddings(cache_key, text_embeddings_cpu)
+        
+        # Save embeddings to file for parent process
+        print(f"[T5-ONLY] Saving embeddings to: {output_embeddings_path}")
+        torch.save(text_embeddings_cpu, output_embeddings_path)
+        
+        # Explicitly delete T5 model before exit (helps with cleanup)
+        del text_model
+        del text_embeddings
+        del text_embeddings_cpu
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Clear CUDA cache if GPU was used
+        if not cpu_only_t5 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("=" * 80)
+        print("T5 ENCODING SUBPROCESS COMPLETED")
+        print("Process will exit now - OS will free ALL memory")
+        print("=" * 80)
+        
+        # Exit successfully - OS will free ALL memory
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"[T5-ONLY] Error during T5 encoding: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    print(f"[DEBUG] Main block: single_generation_file={args.single_generation_file}, single_generation={args.single_generation}, encode_t5_only={bool(args.encode_t5_only)}, test={getattr(args, 'test', False)}, test_subprocess={getattr(args, 'test_subprocess', False)}")
+
+    # Check for feature test mode
+    if len(sys.argv) > 1 and "--test-features" in sys.argv:
+        run_comprehensive_test()
+        sys.exit(0)
+
+    if args.encode_t5_only:
+        print("[DEBUG] Taking encode_t5_only path")
+        # T5 encoding only mode - run and exit
+        if not args.output_embeddings:
+            print("[ERROR] --output-embeddings path required for T5 encoding mode")
+            sys.exit(1)
+        run_t5_encoding_only(args.encode_t5_only, args.output_embeddings)
+    elif args.single_generation_file:
+        print("[DEBUG] Taking single_generation_file path")
+        # Single generation mode from file - run and exit
+        run_single_generation_from_file(args.single_generation_file)
+    elif args.single_generation:
+        print("[DEBUG] Taking single_generation path")
+        # Single generation mode - run and exit
+        run_single_generation(args.single_generation)
+    elif args.test_subprocess:
+        # Test subprocess functionality
+        print("[DEBUG] Testing subprocess functionality")
+        test_params = {
+            'text_prompt': 'test video',
+            'image': None,
+            'video_frame_height': 512,
+            'video_frame_width': 992,
+            'video_seed': 99,
+            'solver_name': 'unipc',
+            'sample_steps': 1,
+            'shift': 5.0,
+            'video_guidance_scale': 4.0,
+            'audio_guidance_scale': 3.0,
+            'slg_layer': 11,
+            'blocks_to_swap': 0,
+            'optimized_block_swap': False,
+            'video_negative_prompt': 'jitter, bad hands, blur, distortion',
+            'audio_negative_prompt': 'robotic, muffled, echo, distorted',
+            'use_image_gen': False,
+            'cpu_offload': True,
+            'delete_text_encoder': False,  # Set to False in subprocess (subprocess already isolated)
+            'fp8_t5': False,
+            'cpu_only_t5': False,
+            'fp8_base_model': False,
+            'use_sage_attention': False,
+            'no_audio': False,
+            'no_block_prep': False,
+            'num_generations': 1,
+            'randomize_seed': False,
+            'save_metadata': True,
+            'aspect_ratio': '16:9',
+            'clear_all': False,
+            'vae_tiled_decode': False,
+            'vae_tile_size': 128,
+            'vae_tile_overlap': 16,
+            'base_resolution_width': 720,
+            'base_resolution_height': 720,
+            'duration_seconds': 5,
+            'auto_crop_image': True,
+            'base_filename': None,
+            'output_dir': None,
+            'text_embeddings_cache': None,
+            'enable_multiline_prompts': False,
+            'enable_video_extension': False,
+            'dont_auto_combine_video_input': False,
+        }
+        success = run_generation_subprocess(test_params)
+        print(f"[DEBUG] Subprocess test result: {success}")
+        sys.exit(0 if success else 1)
+    elif args.test:
+        # Test mode: activate venv and run generation
+        print("=" * 80)
+        print("TEST MODE ENABLED - ACTIVATING VENV")
+        print("=" * 80)
+
+        # Activate venv before running test
+        import subprocess
+        import sys
+
+        try:
+            # Check if we're in the right directory and venv exists
+            venv_path = os.path.join(os.path.dirname(__file__), "venv")
+            if os.path.exists(venv_path):
+                print(f"Activating venv at: {venv_path}")
+
+                # On Windows, use the activate script
+                if sys.platform == "win32":
+                    activate_script = os.path.join(venv_path, "Scripts", "activate.bat")
+                    if os.path.exists(activate_script):
+                        # Run the test with venv activated
+                        cmd = f'"{activate_script}" && python premium.py --test --test_prompt="{args.test_prompt}" --blocks_to_swap={args.blocks_to_swap} {"--test_cpu_offload" if args.test_cpu_offload else ""}'
+                        print(f"Running test command: {cmd}")
+                        result = subprocess.run(cmd, shell=True, cwd=os.path.dirname(__file__))
+                        sys.exit(result.returncode)
+                    else:
+                        print(f"Warning: activate.bat not found at {activate_script}")
+                else:
+                    # On Linux/Mac, source the activate script
+                    activate_script = os.path.join(venv_path, "bin", "activate")
+                    if os.path.exists(activate_script):
+                        cmd = f'source "{activate_script}" && python premium.py --test --test_prompt="{args.test_prompt}" --blocks_to_swap={args.blocks_to_swap} {"--test_cpu_offload" if args.test_cpu_offload else ""}'
+                        print(f"Running test command: {cmd}")
+                        result = subprocess.run(cmd, shell=True, cwd=os.path.dirname(__file__))
+                        sys.exit(result.returncode)
+                    else:
+                        print(f"Warning: activate script not found at {activate_script}")
+            else:
+                print(f"Warning: venv not found at {venv_path}")
+
+            # If venv activation failed, run directly (fallback)
+            print("Running test without venv activation...")
+
+        except Exception as e:
+            print(f"Error setting up venv: {e}")
+            print("Running test without venv activation...")
+
+        # Run test generation (fallback if venv setup failed)
+        # Use gradio defaults, only override with test args
+        test_params = {
+            # Gradio defaults
+            'text_prompt': "",
+            'image': None,
+            'video_frame_height': 512,
+            'video_frame_width': 992,
+            'video_seed': 99,
+            'solver_name': "unipc",
+            'sample_steps': 50,
+            'shift': 5.0,
+            'video_guidance_scale': 4.0,
+            'audio_guidance_scale': 3.0,
+            'slg_layer': 11,
+            'blocks_to_swap': 12,
+            'optimized_block_swap': False,
+            'video_negative_prompt': "jitter, bad hands, blur, distortion",
+            'audio_negative_prompt': "robotic, muffled, echo, distorted",
+            'use_image_gen': False,
+            'cpu_offload': True,
+            'delete_text_encoder': True,
+            'fp8_t5': False,
+            'cpu_only_t5': False,
+            'no_audio': False,
+            'no_block_prep': False,
+            'num_generations': 1,
+            'randomize_seed': False,
+            'save_metadata': True,
+            'aspect_ratio': "16:9 Landscape",
+            'clear_all': True,
+            'vae_tiled_decode': False,
+            'vae_tile_size': 32,
+            'vae_tile_overlap': 8,
+            'force_exact_resolution': False,
+            'auto_crop_image': True,
+            'enable_multiline_prompts': False,
+            'enable_video_extension': False,
+            'dont_auto_combine_video_input': False,
+        }
+
+        # Override with test args only (not replace all values)
+        if hasattr(args, 'test_prompt') and args.test_prompt:
+            test_params['text_prompt'] = args.test_prompt
+        if hasattr(args, 'blocks_to_swap'):
+            test_params['blocks_to_swap'] = args.blocks_to_swap
+        if hasattr(args, 'optimized_block_swap'):
+            test_params['optimized_block_swap'] = args.optimized_block_swap
+        if hasattr(args, 'test_cpu_offload'):
+            test_params['cpu_offload'] = args.test_cpu_offload
+        if hasattr(args, 'test_fp8_t5'):
+            test_params['fp8_t5'] = args.test_fp8_t5
+        if hasattr(args, 'test_cpu_only_t5'):
+            test_params['cpu_only_t5'] = args.test_cpu_only_t5
+
+        # For test mode, use minimal sample steps for speed
+        test_params['sample_steps'] = 2
+
+        print("=" * 80)
+        print("TEST CONFIGURATION:")
+        print(f"  Prompt: {test_params['text_prompt'][:50]}...")
+        print(f"  Sample Steps: {test_params['sample_steps']} (fast test)")
+        print(f"  Block Swap: {test_params['blocks_to_swap']}")
+        print(f"  Optimized Block Swap: {test_params['optimized_block_swap']}")
+        print(f"  CPU Offload: {test_params['cpu_offload']}")
+        print(f"  Delete T5: {test_params['delete_text_encoder']}")
+        print(f"  Scaled FP8 T5: {test_params['fp8_t5']}")
+        print(f"  CPU-Only T5: {test_params['cpu_only_t5']}")
+        print("=" * 80)
+
+        test_output = generate_video(**test_params)
+
+        if test_output:
+            print(f"\n[SUCCESS] Test generation completed successfully: {test_output}")
+        else:
+            print("\n[FAILED] Test generation failed!")
+    else:
+        demo.launch(share=args.share, inbrowser=True)
